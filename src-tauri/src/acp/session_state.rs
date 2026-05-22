@@ -408,6 +408,19 @@ impl SessionState {
                     created_at: Utc::now(),
                 });
             }
+            AcpEvent::PermissionResolved { request_id } => {
+                // Drop the snapshot's pending_permission iff the resolved
+                // request matches the current one. Without the id check, a
+                // late-arriving resolved event for an already-replaced
+                // request could wipe the live dialog out from under the
+                // user.
+                if matches!(
+                    &self.pending_permission,
+                    Some(p) if p.request_id == *request_id,
+                ) {
+                    self.pending_permission = None;
+                }
+            }
             AcpEvent::TurnComplete { .. } => {
                 self.live_message = None;
                 self.active_tool_calls.clear();
@@ -1088,6 +1101,53 @@ mod tests {
         assert!(s.active_tool_calls.is_empty());
         assert!(s.pending_permission.is_none());
         assert_eq!(s.status, ConnectionStatus::Connected);
+    }
+
+    #[test]
+    fn permission_resolved_clears_matching_request() {
+        // Mirrors the pet snapshot semantics: when the user (or auto-approve)
+        // responds, the snapshot's pending_permission must drop *before*
+        // TurnComplete, otherwise a snapshot-recovering frontend (WS attach
+        // after a refresh) would re-render a dialog the user has already
+        // answered.
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::PermissionRequest {
+            request_id: "p-1".into(),
+            tool_call: serde_json::json!({"toolCallId": "tc-1"}),
+            options: vec![],
+        });
+        assert!(s.pending_permission.is_some());
+
+        s.apply_event(&AcpEvent::PermissionResolved {
+            request_id: "p-1".into(),
+        });
+        assert!(
+            s.pending_permission.is_none(),
+            "matching PermissionResolved must clear the pending permission"
+        );
+    }
+
+    #[test]
+    fn permission_resolved_stale_request_is_noop() {
+        // A late `PermissionResolved` for an already-replaced request must
+        // not wipe out the *new* outstanding permission — id mismatch is
+        // the only thing distinguishing the two, since the snapshot only
+        // tracks one pending permission at a time.
+        let mut s = fresh_state();
+        s.apply_event(&AcpEvent::PermissionRequest {
+            request_id: "p-2".into(),
+            tool_call: serde_json::json!({"toolCallId": "tc-2"}),
+            options: vec![],
+        });
+
+        s.apply_event(&AcpEvent::PermissionResolved {
+            request_id: "p-stale".into(),
+        });
+        let p = s
+            .pending_permission
+            .as_ref()
+            .expect("stale PermissionResolved must not clear a non-matching pending permission");
+        assert_eq!(p.request_id, "p-2");
     }
 
     #[test]

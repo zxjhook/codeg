@@ -2782,6 +2782,12 @@ async fn run_conversation_loop<'a>(
                                             SelectedPermissionOutcome::new(option_id),
                                         );
                                         let _ = responder.respond(RequestPermissionResponse::new(outcome));
+                                        emit_with_state(
+                                            state,
+                                            emitter,
+                                            AcpEvent::PermissionResolved { request_id },
+                                        )
+                                        .await;
                                     }
                                 }
                                 Some(ConnectionCommand::SetMode { mode_id }) => {
@@ -2930,6 +2936,12 @@ async fn run_conversation_loop<'a>(
                         SelectedPermissionOutcome::new(option_id),
                     );
                     let _ = responder.respond(RequestPermissionResponse::new(outcome));
+                    emit_with_state(
+                        state,
+                        emitter,
+                        AcpEvent::PermissionResolved { request_id },
+                    )
+                    .await;
                 }
             }
             Some(ConnectionCommand::SetMode { mode_id }) => {

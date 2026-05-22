@@ -113,6 +113,17 @@ impl PetGlobalState {
                 self.pending_permissions
                     .insert(request_id.clone(), conn.clone());
             }
+            AcpEvent::PermissionResolved { request_id } => {
+                // User answered (allow/reject) or chat-channel auto-approve
+                // ran. responder.respond() is RPC-only with no follow-up
+                // event of its own, so the connection emits this synthetic
+                // event right after sending the response. Without it the
+                // entry lives on until TurnComplete, which for Plan
+                // approvals (ExitPlanMode) is the entire post-approval
+                // implementation window — pinning the pet on Waiting
+                // throughout.
+                self.pending_permissions.remove(request_id);
+            }
             AcpEvent::TurnComplete { .. } => {
                 self.prompting.remove(conn);
                 // A permission request is bounded by the turn that raised it:
@@ -171,6 +182,7 @@ fn is_acp_event_relevant(payload: &AcpEvent) -> bool {
         AcpEvent::StatusChanged { .. }
             | AcpEvent::Error { .. }
             | AcpEvent::PermissionRequest { .. }
+            | AcpEvent::PermissionResolved { .. }
             | AcpEvent::TurnComplete { .. }
             | AcpEvent::ConversationStatusChanged { .. }
     )
@@ -653,6 +665,67 @@ mod tests {
     }
 
     #[test]
+    fn permission_resolved_clears_matching_entry() {
+        // The user answering allow/reject must drop the pet out of Waiting
+        // immediately — without waiting for the eventual TurnComplete. This
+        // is the post-Plan-approval case: the agent then runs for minutes
+        // doing implementation work, and the pet would otherwise sit on
+        // Waiting through all of it.
+        let mut s = PetGlobalState::default();
+        s.apply(&env(
+            "c1",
+            AcpEvent::StatusChanged {
+                status: ConnectionStatus::Prompting,
+            },
+        ));
+        s.apply(&env(
+            "c1",
+            AcpEvent::PermissionRequest {
+                request_id: "r1".into(),
+                tool_call: serde_json::json!({}),
+                options: vec![],
+            },
+        ));
+        assert_eq!(compute_pet_state(&s), PetState::Waiting);
+
+        s.apply(&env(
+            "c1",
+            AcpEvent::PermissionResolved {
+                request_id: "r1".into(),
+            },
+        ));
+        assert!(s.pending_permissions.is_empty());
+        assert_eq!(
+            compute_pet_state(&s),
+            PetState::Running,
+            "after resolving the permission, the still-prompting connection should surface as Running"
+        );
+    }
+
+    #[test]
+    fn permission_resolved_for_unknown_id_is_noop() {
+        // Late / duplicate resolution events must not disturb other
+        // outstanding permissions.
+        let mut s = PetGlobalState::default();
+        s.apply(&env(
+            "c1",
+            AcpEvent::PermissionRequest {
+                request_id: "r1".into(),
+                tool_call: serde_json::json!({}),
+                options: vec![],
+            },
+        ));
+        s.apply(&env(
+            "c1",
+            AcpEvent::PermissionResolved {
+                request_id: "r-stale".into(),
+            },
+        ));
+        assert_eq!(s.pending_permissions.len(), 1);
+        assert_eq!(compute_pet_state(&s), PetState::Waiting);
+    }
+
+    #[test]
     fn permission_request_outranks_active_prompting() {
         // An outstanding permission is blocking — the agent literally can't
         // proceed without user input — so it must outrank Running even
@@ -711,6 +784,9 @@ mod tests {
                 request_id: "r1".into(),
                 tool_call: serde_json::json!({}),
                 options: vec![],
+            },
+            AcpEvent::PermissionResolved {
+                request_id: "r1".into(),
             },
             AcpEvent::TurnComplete {
                 session_id: "s".into(),

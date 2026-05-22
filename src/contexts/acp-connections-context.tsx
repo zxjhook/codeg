@@ -273,7 +273,17 @@ type Action =
       fallback_kind: string
       options: PermissionOptionInfo[]
     }
-  | { type: "PERMISSION_CLEARED"; contextKey: string }
+  | {
+      type: "PERMISSION_CLEARED"
+      contextKey: string
+      /**
+       * When present, only clear if the current pendingPermission's request_id
+       * matches. Guards against a late `permission_resolved` event wiping out a
+       * fresh permission that was raised between resolve and dispatch.
+       * Omit for unconditional clears (e.g. cancel paths).
+       */
+      requestId?: string
+    }
   | {
       type: "SET_PENDING_QUESTION"
       contextKey: string
@@ -1213,6 +1223,12 @@ function connectionsReducer(
     case "PERMISSION_CLEARED": {
       const conn = state.get(action.contextKey)
       if (!conn) return state
+      if (
+        action.requestId !== undefined &&
+        conn.pendingPermission?.request_id !== action.requestId
+      ) {
+        return state
+      }
       const next = new Map(state)
       next.set(action.contextKey, {
         ...conn,
@@ -2082,6 +2098,20 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
             images: e.images ?? null,
           })
           scheduleToolCallUpdateFlush()
+          break
+        case "permission_resolved":
+          // Backend signals a permission was answered (this window's local
+          // respondPermission, a sibling window, a server-mode peer, or
+          // chat-channel auto-approve). The local-respond path already
+          // dispatched PERMISSION_CLEARED synchronously, so this is a no-op
+          // there; the other three paths rely on this branch to retire the
+          // dialog without waiting for TurnComplete. Matched by request_id so
+          // a stale event can't wipe a fresh permission.
+          dispatch({
+            type: "PERMISSION_CLEARED",
+            contextKey,
+            requestId: e.request_id,
+          })
           break
         case "permission_request":
           flushStreamingQueue()
@@ -3126,7 +3156,7 @@ export function AcpConnectionsProvider({ children }: { children: ReactNode }) {
       try {
         lastActivityRef.current.set(contextKey, Date.now())
         await acpRespondPermission(conn.connectionId, requestId, optionId)
-        dispatch({ type: "PERMISSION_CLEARED", contextKey })
+        dispatch({ type: "PERMISSION_CLEARED", contextKey, requestId })
       } catch (e) {
         console.error("[AcpConnections] respondPermission failed:", e)
         throw e

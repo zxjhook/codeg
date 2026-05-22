@@ -113,6 +113,15 @@ pub enum AcpEvent {
         tool_call: serde_json::Value,
         options: Vec<PermissionOptionInfo>,
     },
+    /// User responded to (or the connection drained) a previously-pending
+    /// permission request. The responder.respond() side of the SACP exchange
+    /// is RPC-only, so without this event downstream consumers (pet snapshot,
+    /// session_state for snapshot recovery) would have to wait until
+    /// TurnComplete to learn that the permission is no longer outstanding —
+    /// keeping the pet pinned on `Waiting` through whatever work the agent
+    /// does after the approval (which, for ExitPlanMode, is the entire
+    /// implementation phase).
+    PermissionResolved { request_id: String },
     /// Turn completed
     TurnComplete {
         session_id: String,
