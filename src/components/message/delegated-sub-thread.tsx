@@ -79,6 +79,11 @@ const KNOWN_AGENT_TYPES: ReadonlySet<string> = new Set<AgentType>([
   "open_claw",
 ])
 
+// Module-level empty map so the reducer's initial state has a stable
+// reference across mounts. New entries are always inserted into a
+// fresh `new Map(state)` copy, so the constant itself stays frozen.
+const EMPTY_TURN_MAP: ReadonlyMap<string, string> = new Map()
+
 /**
  * Subscribe to the child connection's `ConnectionState` (live message,
  * pending permission, etc.) from the shared connections store. Returns
@@ -159,33 +164,159 @@ function parseDelegationMeta(
   }
 }
 
+const EMPTY_PARSED_INPUT: ParsedInput = {
+  agentType: null,
+  task: null,
+  workingDir: null,
+  timeoutSeconds: null,
+}
+
+// Wrapper keys that hosts use to nest the actual tool arguments. JSON-RPC
+// servers and various MCP relays will pack the call as `{name, arguments}`
+// or `{params: {...}}`; some agents stash the args under a generic
+// `input`/`payload` key alongside metadata. Walked recursively (small
+// depth cap) so any single layer of wrapping peels off without false
+// positives on legitimate shallow fields.
+const ARGS_WRAPPER_KEYS = [
+  "arguments",
+  "input",
+  "params",
+  "payload",
+  "_meta",
+] as const
+
+function findDelegationArgs(
+  value: unknown,
+  depth = 0
+): Record<string, unknown> | null {
+  if (depth > 4) return null
+  if (value === null || value === undefined) return null
+  // Some hosts double-encode the raw input (JSON-of-JSON). Recurse once
+  // on the parsed inner value before giving up.
+  if (typeof value === "string") {
+    try {
+      return findDelegationArgs(JSON.parse(value), depth + 1)
+    } catch {
+      return null
+    }
+  }
+  if (typeof value !== "object" || Array.isArray(value)) return null
+  const obj = value as Record<string, unknown>
+  // Direct hit: this object has at least one of the delegation fields
+  // declared on its top level.
+  if (
+    typeof obj.task === "string" ||
+    typeof obj.agent_type === "string" ||
+    typeof obj.working_dir === "string" ||
+    typeof obj.timeout_seconds === "number"
+  ) {
+    return obj
+  }
+  for (const key of ARGS_WRAPPER_KEYS) {
+    const child = obj[key]
+    if (child === undefined) continue
+    const found = findDelegationArgs(child, depth + 1)
+    if (found) return found
+  }
+  return null
+}
+
+// One-line debug breadcrumb. The walker covers the wrappers we know about
+// (`arguments`, `input`, `params`, `payload`, `_meta`); if a non-empty raw
+// input still doesn't yield delegation args, the host is using a shape we
+// haven't accounted for. Logging a truncated sample makes the next "task
+// didn't show up" report self-debugging — the actual wire shape lands in
+// the user's devtools instead of needing a repro.
+function warnDelegationInputUnparseable(raw: string, reason: string): void {
+  const sample = raw.length > 240 ? `${raw.slice(0, 240)}…` : raw
+  console.warn(
+    `[DelegatedSubThread] could not extract delegation args (${reason}). raw=${sample}`
+  )
+}
+
 function parseInput(raw: string | null | undefined): ParsedInput {
-  if (!raw || typeof raw !== "string") {
-    return {
-      agentType: null,
-      task: null,
-      workingDir: null,
-      timeoutSeconds: null,
-    }
-  }
+  if (!raw || typeof raw !== "string") return EMPTY_PARSED_INPUT
+  let parsed: unknown
   try {
-    const obj = JSON.parse(raw) as Record<string, unknown>
-    const at = typeof obj.agent_type === "string" ? obj.agent_type : null
-    return {
-      agentType: at && KNOWN_AGENT_TYPES.has(at) ? (at as AgentType) : null,
-      task: typeof obj.task === "string" ? obj.task : null,
-      workingDir: typeof obj.working_dir === "string" ? obj.working_dir : null,
-      timeoutSeconds:
-        typeof obj.timeout_seconds === "number" ? obj.timeout_seconds : null,
-    }
+    parsed = JSON.parse(raw)
   } catch {
+    warnDelegationInputUnparseable(raw, "JSON.parse threw")
+    return EMPTY_PARSED_INPUT
+  }
+  const obj = findDelegationArgs(parsed)
+  if (!obj) {
+    warnDelegationInputUnparseable(raw, "no known wrapper matched")
+    return EMPTY_PARSED_INPUT
+  }
+  const at = typeof obj.agent_type === "string" ? obj.agent_type : null
+  return {
+    agentType: at && KNOWN_AGENT_TYPES.has(at) ? (at as AgentType) : null,
+    task: typeof obj.task === "string" ? obj.task : null,
+    workingDir: typeof obj.working_dir === "string" ? obj.working_dir : null,
+    timeoutSeconds:
+      typeof obj.timeout_seconds === "number" ? obj.timeout_seconds : null,
+  }
+}
+
+/**
+ * Find the first complete JSON object embedded in `raw` and parse it.
+ * Used to recover the broker's envelope from host-specific wrappings —
+ * notably Codex, which serializes the MCP `function_call_output` as
+ * `"Wall time: N seconds\nOutput:\n<json>"` (sometimes with a trailing
+ * terminal-cursor character such as `_`). Direct `JSON.parse(raw)`
+ * fails on these because of the textual prefix/suffix; this scanner
+ * walks back from the last `}` until a balanced span parses cleanly.
+ *
+ * Returns null when no `{...}` substring parses. Bounded iteration:
+ * each attempt shrinks the candidate by one `}`, so worst-case work is
+ * linear in the count of `}` characters in `raw`.
+ */
+function extractEmbeddedJsonObject(
+  raw: string
+): Record<string, unknown> | null {
+  const start = raw.indexOf("{")
+  if (start < 0) return null
+  let end = raw.lastIndexOf("}")
+  while (end > start) {
+    const candidate = raw.slice(start, end + 1)
+    try {
+      const v = JSON.parse(candidate)
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        return v as Record<string, unknown>
+      }
+    } catch {
+      // try a shorter span
+    }
+    end = raw.lastIndexOf("}", end - 1)
+    if (end < 0) break
+  }
+  return null
+}
+
+/**
+ * Read the broker's `{ kind: "ok"|"err", text|message|code, ... }` shape
+ * straight off `obj`. Returns null when `kind` is missing or unknown so
+ * the caller can fall through to other unwrapping strategies. Split out
+ * of `parseDelegationOutcome` so the MCP `CallToolResult` envelope path
+ * can reuse it on the inner `structuredContent` object.
+ */
+function interpretBrokerEnvelope(
+  obj: Record<string, unknown>
+): { text: string; isError: boolean } | null {
+  const kind = typeof obj.kind === "string" ? obj.kind : null
+  if (kind === "ok") {
+    const text = typeof obj.text === "string" ? obj.text : ""
+    return { text, isError: false }
+  }
+  if (kind === "err") {
+    const message = typeof obj.message === "string" ? obj.message : ""
+    const code = typeof obj.code === "string" ? obj.code : ""
     return {
-      agentType: null,
-      task: null,
-      workingDir: null,
-      timeoutSeconds: null,
+      text: message || code || "Delegation failed.",
+      isError: true,
     }
   }
+  return null
 }
 
 /**
@@ -193,9 +324,16 @@ function parseInput(raw: string | null | undefined): ParsedInput {
  * `delegate_to_agent` MCP tool's output. The broker's wire shape is
  *   { kind: "ok", text: "...", child_conversation_id, ... }
  *   { kind: "err", code: "...", message: "..." }
- * but the surrounding tool-call layer may JSON-stringify it OR pass it
- * through verbatim. Try the structured shape first; fall back to the
- * raw string for plain-text outputs.
+ * but the surrounding tool-call layer may JSON-stringify it, pass it
+ * through verbatim, OR wrap it in host-specific text (Codex prepends
+ * `Wall time: X seconds\nOutput:\n` and may trail a terminal-cursor
+ * character). On top of that, the MCP host (Claude Code / Codex MCP
+ * client) ALSO wraps the broker outcome in the standard `CallToolResult`
+ * envelope produced by `companion.rs::render_tool_result`:
+ *   { content: [{ type: "text", text }], isError, structuredContent }
+ * Try direct parse first, then embedded-object scanning; unwrap the MCP
+ * envelope when present, then read the broker shape; finally fall back
+ * to the raw string for plain-text outputs.
  */
 function parseDelegationOutcome(raw: string | null | undefined): {
   text: string
@@ -204,33 +342,65 @@ function parseDelegationOutcome(raw: string | null | undefined): {
   if (!raw || typeof raw !== "string") return null
   const trimmed = raw.trim()
   if (!trimmed) return null
+
+  let obj: Record<string, unknown> | null = null
   try {
     const v = JSON.parse(trimmed) as unknown
     if (v && typeof v === "object" && !Array.isArray(v)) {
-      const obj = v as Record<string, unknown>
-      const kind = typeof obj.kind === "string" ? obj.kind : null
-      if (kind === "ok") {
-        const text = typeof obj.text === "string" ? obj.text : ""
-        return { text, isError: false }
+      obj = v as Record<string, unknown>
+    } else {
+      // Top-level primitive (string/number/bool): render directly.
+      return { text: String(v), isError: false }
+    }
+  } catch {
+    obj = extractEmbeddedJsonObject(trimmed)
+  }
+
+  if (!obj) {
+    return { text: trimmed, isError: false }
+  }
+
+  // MCP `CallToolResult` envelope: produced by
+  // `src-tauri/src/acp/delegation/companion.rs::render_tool_result`.
+  // Claude Code's MCP client serializes the whole envelope as the
+  // tool-call output (verified against live Claude Code sub-agent runs;
+  // before this branch the inner `structuredContent` leaked through as
+  // a JSON code block). Prefer the inner `structuredContent` because it
+  // carries the broker's full `kind`/`text`/`code`/`message` fields;
+  // fall back to `content[0].text` (which the companion already
+  // extracted) when `structuredContent` is missing or malformed.
+  if (
+    Array.isArray(obj.content) &&
+    obj.structuredContent &&
+    typeof obj.structuredContent === "object" &&
+    !Array.isArray(obj.structuredContent)
+  ) {
+    const inner = obj.structuredContent as Record<string, unknown>
+    const interpretedInner = interpretBrokerEnvelope(inner)
+    if (interpretedInner) {
+      // Trust outer `isError: true` even when the inner shape didn't
+      // explicitly set kind:"err" — the host has already decided.
+      if (obj.isError === true && !interpretedInner.isError) {
+        return { ...interpretedInner, isError: true }
       }
-      if (kind === "err") {
-        const message = typeof obj.message === "string" ? obj.message : ""
-        const code = typeof obj.code === "string" ? obj.code : ""
-        return {
-          text: message || code || "Delegation failed.",
-          isError: true,
-        }
-      }
-      // Other JSON shapes — pretty-print so we don't surface raw braces.
-      return {
-        text: "```json\n" + JSON.stringify(v, null, 2) + "\n```",
-        isError: false,
+      return interpretedInner
+    }
+    const first = (obj.content as unknown[])[0]
+    if (first && typeof first === "object" && !Array.isArray(first)) {
+      const text = (first as Record<string, unknown>).text
+      if (typeof text === "string") {
+        return { text, isError: obj.isError === true }
       }
     }
-    // JSON-parsed primitive — render directly.
-    return { text: String(v), isError: false }
-  } catch {
-    return { text: trimmed, isError: false }
+  }
+
+  const interpreted = interpretBrokerEnvelope(obj)
+  if (interpreted) return interpreted
+
+  // Other JSON shapes — pretty-print so we don't surface raw braces.
+  return {
+    text: "```json\n" + JSON.stringify(obj, null, 2) + "\n```",
+    isError: false,
   }
 }
 
@@ -365,24 +535,52 @@ export function DelegatedSubThread({
   }, [output, errorText])
 
   // Real-time view of the child's assistant text — *all* text segments
-  // concatenated in arrival order, with no separator. We deliberately
-  // strip:
+  // concatenated in arrival order, ACROSS turns. We deliberately strip:
   //   - thinking blocks (internal reasoning, not the result)
   //   - tool_call / plan blocks (intermediate steps)
   // but we keep every text segment so the user sees the child's visible
-  // output grow append-only. Each new segment is appended directly to
-  // whatever has accumulated so far; later segments NEVER overwrite
-  // earlier ones. Once the broker's outcome lands on `output`,
-  // `outcome.text` takes over.
-  const liveStreamText = useMemo<string | null>(() => {
-    const blocks = childLive?.liveMessage?.content ?? []
+  // output grow append-only. Once the broker's outcome lands on
+  // `output`, `outcome.text` takes over.
+  //
+  // Cross-turn accumulation: the connections store resets
+  // `liveMessage.content` to `[]` on every `STATUS_CHANGED("prompting")`
+  // (one fires per child turn), wiping the previous turn's visible
+  // text. We keep an id-keyed `Map<turnId, text>` in reducer state so
+  // each turn contributes its final text exactly once. Map preserves
+  // insertion order, so concatenation matches arrival order. useReducer
+  // (not useState) so dispatching in effect doesn't trip the
+  // `react-hooks/set-state-in-effect` lint rule — same pattern as the
+  // auto-expand block above.
+  const [seenTurns, observeTurnText] = useReducer(
+    (
+      state: ReadonlyMap<string, string>,
+      action: { id: string; text: string }
+    ): ReadonlyMap<string, string> => {
+      if (state.get(action.id) === action.text) return state
+      const next = new Map(state)
+      next.set(action.id, action.text)
+      return next
+    },
+    EMPTY_TURN_MAP
+  )
+  useEffect(() => {
+    const liveMessage = childLive?.liveMessage
+    if (!liveMessage) return
     const parts: string[] = []
-    for (const b of blocks) {
+    for (const b of liveMessage.content) {
       if (b.type === "text" && b.text.trim().length > 0) parts.push(b.text)
     }
-    if (parts.length === 0) return null
-    return parts.join("")
+    observeTurnText({ id: liveMessage.id, text: parts.join("") })
   }, [childLive])
+
+  const liveStreamText = useMemo<string | null>(() => {
+    const turns: string[] = []
+    for (const text of seenTurns.values()) {
+      if (text.length > 0) turns.push(text)
+    }
+    if (turns.length === 0) return null
+    return turns.join("\n\n")
+  }, [seenTurns])
 
   // Caller (ToolCallPart) already guarantees this is a `delegate_to_agent`
   // tool, but a snapshot replay with an empty/unparseable input AND no live

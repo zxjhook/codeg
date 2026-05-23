@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react"
+import { act, fireEvent, render, screen } from "@testing-library/react"
 import { NextIntlClientProvider } from "next-intl"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -19,6 +19,15 @@ const mockAttachDelegationChild = vi.fn()
 const mockDetachDelegationChild = vi.fn()
 const mockRespondPermission = vi.fn()
 let mockChildConnection: unknown = undefined
+// Active store-subscribe callbacks. Cross-turn accumulation tests
+// mutate `mockChildConnection` to simulate store updates and then
+// invoke `notifyStore()` to re-trigger `useSyncExternalStore`'s
+// snapshot read, replaying what a real `STATUS_CHANGED` dispatch
+// would do.
+let storeCallbacks: Array<() => void> = []
+function notifyStore() {
+  for (const cb of storeCallbacks) cb()
+}
 
 vi.mock("@/contexts/delegation-context", async () => {
   const actual = await vi.importActual<
@@ -47,9 +56,14 @@ vi.mock("@/contexts/acp-connections-context", async () => {
       respondPermission: mockRespondPermission,
     }),
     useConnectionStore: () => ({
-      // Subscribe is a no-op; getConnection returns whatever the test
-      // configured for the synthetic child entry.
-      subscribeKey: () => () => {},
+      // Track subscribers so tests can simulate a store update by
+      // mutating `mockChildConnection` and calling `notifyStore()`.
+      subscribeKey: (_key: string, cb: () => void) => {
+        storeCallbacks.push(cb)
+        return () => {
+          storeCallbacks = storeCallbacks.filter((c) => c !== cb)
+        }
+      },
       getConnection: () => mockChildConnection,
       getActiveKey: () => null,
       subscribeActiveKey: () => () => {},
@@ -131,6 +145,7 @@ describe("DelegatedSubThread", () => {
     mockDetachDelegationChild.mockReset()
     mockRespondPermission.mockReset()
     mockChildConnection = undefined
+    storeCallbacks = []
     // Default: no live binding from the in-memory context. Individual
     // tests can override per case.
     mockFindByParentToolUseId.mockReturnValue(undefined)
@@ -181,6 +196,72 @@ describe("DelegatedSubThread", () => {
     expect(screen.getByText("summarize the failing tests")).toBeInTheDocument()
     expect(screen.getAllByText("Codex").length).toBeGreaterThan(0)
   })
+
+  it.each<{ shape: string; input: string; expectedTask: string }>([
+    {
+      // MCP tools/call request envelope — hosts that forward the JSON-RPC
+      // params verbatim land in this shape.
+      shape: "{name, arguments}",
+      input: JSON.stringify({
+        name: "delegate_to_agent",
+        arguments: { agent_type: "codex", task: "wrapped via arguments" },
+      }),
+      expectedTask: "wrapped via arguments",
+    },
+    {
+      // Generic JSON-RPC wrapper. Codex live ACP sometimes packs the
+      // delegation args under `params.input` after its own pre-processing.
+      shape: "{params: {input: {...}}}",
+      input: JSON.stringify({
+        params: {
+          input: { agent_type: "codex", task: "wrapped via params.input" },
+        },
+      }),
+      expectedTask: "wrapped via params.input",
+    },
+    {
+      // claude-agent-acp's MCP relay attaches `_meta` alongside the args.
+      // The current parser walks `_meta` last so the direct keys still
+      // win, but a wrapper-style payload also has to peel.
+      shape: "{_meta, agent_type, task}",
+      input: JSON.stringify({
+        _meta: { claudeCode: { toolName: "delegate_to_agent" } },
+        agent_type: "codex",
+        task: "direct fields next to _meta",
+      }),
+      expectedTask: "direct fields next to _meta",
+    },
+    {
+      // Double-encoded JSON-of-JSON string (defensive — some hosts wrap
+      // the input in an extra JSON.stringify call on the way out).
+      shape: "double-encoded JSON string",
+      input: JSON.stringify(
+        JSON.stringify({
+          agent_type: "codex",
+          task: "double-encoded task",
+        })
+      ),
+      expectedTask: "double-encoded task",
+    },
+  ])(
+    "extracts the task line out of the $shape wrapper",
+    ({ input, expectedTask }) => {
+      mockedHook.mockReturnValue({
+        binding: undefined,
+        detail: null,
+        loading: false,
+        error: null,
+      })
+      renderWithIntl(
+        <DelegatedSubThread parentToolUseId="pt-1" input={input} />
+      )
+      // Literal-string assertion (no mirror walker) — if the implementation's
+      // walker silently drops a known wrapper, the test fails because the
+      // rendered card lacks the expected text, not because both sides agree
+      // on what "expected" means.
+      expect(screen.getByText(expectedTask)).toBeInTheDocument()
+    }
+  )
 
   it("shows the error badge with the localized code", () => {
     mockedHook.mockReturnValue({
@@ -579,5 +660,254 @@ describe("DelegatedSubThread", () => {
     // renders a sentinel that asserts its mount.
     expect(screen.getByTestId("permission-dialog")).toBeInTheDocument()
     expect(screen.getByText("permission for req-9")).toBeInTheDocument()
+  })
+
+  it("unwraps the MCP CallToolResult envelope so structuredContent.text renders as markdown — not a JSON code block", () => {
+    // companion.rs::render_tool_result wraps the broker outcome in the
+    // standard MCP `CallToolResult` shape:
+    //   { content: [{type:"text",text}], isError, structuredContent }
+    // The host (Claude Code's / Codex's MCP client) serializes that whole
+    // envelope as the tool-call output. Before the unwrap branch the
+    // outer object had no top-level `kind`, so the renderer fell through
+    // to the JSON-pretty-print path and surfaced raw {"content":…,
+    // "structuredContent":…} braces in a fenced code block. The expanded
+    // card must look inside `structuredContent` and render its `text`
+    // field as markdown.
+    mockedHook.mockReturnValue({
+      binding: bindingOf({ status: "ok" }),
+      detail: null,
+      loading: false,
+      error: null,
+    })
+    const structured = {
+      child_agent_type: "claude_code",
+      child_conversation_id: 1019,
+      duration_ms: 0,
+      kind: "ok",
+      text: "# Build Result\n\nBuild succeeded.",
+      turn_count: 1,
+    }
+    const mcpEnvelope = JSON.stringify({
+      content: [{ type: "text", text: structured.text }],
+      isError: false,
+      structuredContent: structured,
+    })
+    renderWithIntl(
+      <DelegatedSubThread
+        parentToolUseId="pt-1"
+        output={mcpEnvelope}
+        state="output-available"
+      />
+    )
+    fireEvent.click(screen.getByRole("button"))
+    // Inner text is rendered through the markdown stub; the H1 heading
+    // proves the markdown path, not the JSON pretty-print path.
+    expect(screen.getByRole("heading", { level: 1 })).toHaveTextContent(
+      "Build Result"
+    )
+    expect(screen.getByText("Build succeeded.")).toBeInTheDocument()
+    // None of the envelope wrapper keys should leak into the rendered
+    // body — those are signs the JSON-pretty-print fallback fired.
+    expect(screen.queryByText(/structuredContent/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/isError/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/child_agent_type/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/turn_count/)).not.toBeInTheDocument()
+  })
+
+  it("unwraps the MCP envelope even when nested inside Codex 'Wall time:…\\nOutput:\\n' wrapping", () => {
+    // Codex's `function_call_output` may sandwich the MCP CallToolResult
+    // envelope between a "Wall time:" prefix and a trailing terminal
+    // cursor. Both layers of wrapping have to peel cleanly so the inner
+    // broker text reaches the user.
+    mockedHook.mockReturnValue({
+      binding: bindingOf({ status: "ok" }),
+      detail: null,
+      loading: false,
+      error: null,
+    })
+    const structured = {
+      child_agent_type: "claude_code",
+      kind: "ok",
+      text: "All green.",
+      turn_count: 1,
+    }
+    const mcpEnvelope = JSON.stringify({
+      content: [{ type: "text", text: structured.text }],
+      isError: false,
+      structuredContent: structured,
+    })
+    const codexWrapped = `Wall time: 4.21 seconds\nOutput:\n${mcpEnvelope}_`
+    renderWithIntl(
+      <DelegatedSubThread
+        parentToolUseId="pt-1"
+        output={codexWrapped}
+        state="output-available"
+      />
+    )
+    fireEvent.click(screen.getByRole("button"))
+    expect(screen.getByText("All green.")).toBeInTheDocument()
+    expect(screen.queryByText(/Wall time:/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/structuredContent/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/turn_count/)).not.toBeInTheDocument()
+  })
+
+  it("inherits the MCP envelope's isError flag when the host marked the tool call as errored", () => {
+    // If the host returns `isError: true` but the inner structuredContent
+    // doesn't redundantly set kind:"err", we still treat it as an error
+    // outcome (renders in the destructive style).
+    mockedHook.mockReturnValue({
+      binding: bindingOf({ status: "err", errorCode: "spawn_failed" }),
+      detail: null,
+      loading: false,
+      error: null,
+    })
+    const mcpEnvelope = JSON.stringify({
+      content: [{ type: "text", text: "failed to spawn child" }],
+      isError: true,
+      structuredContent: {
+        // Inner has kind:"ok" by accident — outer isError wins.
+        kind: "ok",
+        text: "failed to spawn child",
+      },
+    })
+    renderWithIntl(
+      <DelegatedSubThread
+        parentToolUseId="pt-1"
+        output={mcpEnvelope}
+        state="output-error"
+      />
+    )
+    fireEvent.click(screen.getByRole("button"))
+    // The destructive container wraps DelegationOutcomeText — assert via
+    // the inner text plus the destructive className on the container.
+    const card = screen.getByTestId("markdown-stub").parentElement
+    expect(card?.className).toContain("text-destructive")
+    expect(screen.getByText("failed to spawn child")).toBeInTheDocument()
+  })
+
+  it("unwraps the broker envelope when Codex prepends 'Wall time:…\\nOutput:\\n' and trails a terminal cursor", () => {
+    // Codex serializes the MCP `function_call_output` for non-exec tools
+    // as `"Wall time: X seconds\nOutput:\n<envelope-json>"`, sometimes
+    // with a trailing cursor character. A naive `JSON.parse(output)`
+    // fails and the raw blob leaks into the expanded body. The expanded
+    // card must surface only the envelope's `text` field, never the
+    // outer wrapping or the JSON envelope.
+    mockedHook.mockReturnValue({
+      binding: bindingOf({ status: "ok" }),
+      detail: null,
+      loading: false,
+      error: null,
+    })
+    const envelope = JSON.stringify({
+      child_agent_type: "claude_code",
+      child_conversation_id: 1015,
+      duration_ms: 0,
+      kind: "ok",
+      text: "Build succeeded.\nExit code: 0",
+      turn_count: 1,
+    })
+    const codexWrapped = `Wall time: 33.5341 seconds\nOutput:\n${envelope}_`
+    renderWithIntl(
+      <DelegatedSubThread
+        parentToolUseId="pt-1"
+        output={codexWrapped}
+        state="output-available"
+      />
+    )
+    fireEvent.click(screen.getByRole("button"))
+    expect(screen.getByText("Build succeeded.")).toBeInTheDocument()
+    expect(screen.getByText(/Exit code: 0/)).toBeInTheDocument()
+    expect(screen.queryByText(/Wall time:/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/child_agent_type/)).not.toBeInTheDocument()
+    expect(screen.queryByText(/turn_count/)).not.toBeInTheDocument()
+  })
+
+  it("accumulates live text across child turns — STATUS_CHANGED resets liveMessage.content but prior turns stay visible", () => {
+    // Each child turn opens a fresh `liveMessage` (new id, empty
+    // content) in the connections store. Without cross-turn buffering,
+    // the parent card would show only the current turn's text and the
+    // previous turn would vanish. The card must accumulate text across
+    // turns so users see the child's full streaming output append-only.
+    mockedHook.mockReturnValue({
+      binding: bindingOf({ status: "running" }),
+      detail: null,
+      loading: false,
+      error: null,
+    })
+    const baseChildConn = {
+      connectionId: "c1",
+      contextKey: "c1",
+      agentType: "codex",
+      workingDir: null,
+      status: "connected",
+      promptCapabilities: {
+        image: false,
+        audio: false,
+        embedded_context: false,
+      },
+      supportsFork: false,
+      selectorsReady: true,
+      sessionId: null,
+      modes: null,
+      configOptions: null,
+      availableCommands: null,
+      usage: null,
+      pendingPermission: null,
+      pendingQuestion: null,
+      claudeApiRetry: null,
+      error: null,
+      loadError: null,
+      lastAppliedSeq: 0,
+      isDelegationChild: true,
+      parentToolUseId: "pt-1",
+      parentConnectionId: "p1",
+    }
+
+    // Turn 1: child emits some assistant text.
+    mockChildConnection = {
+      ...baseChildConn,
+      liveMessage: {
+        id: "turn-1",
+        role: "assistant",
+        content: [{ type: "text", text: "checking the build first" }],
+        startedAt: Date.now(),
+      },
+    }
+    renderWithIntl(<DelegatedSubThread parentToolUseId="pt-1" />)
+    fireEvent.click(screen.getByRole("button"))
+    expect(screen.getByText(/checking the build first/)).toBeInTheDocument()
+
+    // STATUS_CHANGED("prompting") fires for turn 2: liveMessage is
+    // replaced with a new id and empty content. Prior turn's text must
+    // survive in the expanded body.
+    mockChildConnection = {
+      ...baseChildConn,
+      liveMessage: {
+        id: "turn-2",
+        role: "assistant",
+        content: [],
+        startedAt: Date.now(),
+      },
+    }
+    act(() => {
+      notifyStore()
+    })
+    expect(screen.getByText(/checking the build first/)).toBeInTheDocument()
+
+    // Turn 2 text arrives. Both turns must be visible together.
+    mockChildConnection = {
+      ...baseChildConn,
+      liveMessage: {
+        id: "turn-2",
+        role: "assistant",
+        content: [{ type: "text", text: "now reporting the result" }],
+        startedAt: Date.now(),
+      },
+    }
+    act(() => {
+      notifyStore()
+    })
+    expect(screen.getByText(/checking the build first/)).toBeInTheDocument()
+    expect(screen.getByText(/now reporting the result/)).toBeInTheDocument()
   })
 })

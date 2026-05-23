@@ -260,11 +260,12 @@ export function normalizeToolName(toolName: string): string {
   const alias = EXACT_TOOL_NAME_ALIASES[canonical]
   if (alias) return alias
 
-  // Multi-agent delegation MCP tool. The MCP server prefix
-  // (`mcp__<server>__`) varies — codeg-delegate today, possibly renamed
-  // tomorrow. Match the suffix so any server name lands on the same
-  // canonical name as the in-tree alias.
-  if (canonical.endsWith("__delegate_to_agent")) return "delegate_to_agent"
+  // Multi-agent delegation MCP tool. Server prefix AND separator both
+  // vary by host: Claude Code uses `mcp__<server>__delegate_to_agent`,
+  // Codex live ACP exposes `<server>/delegate_to_agent`, others use `.`
+  // or `:`. Match `delegate_to_agent` after any non-alphanumeric
+  // separator so every form collapses to the same canonical name.
+  if (/[^a-z0-9]delegate_to_agent$/.test(canonical)) return "delegate_to_agent"
 
   const freeform = inferFromFreeformName(trimmed)
   if (freeform) return freeform
