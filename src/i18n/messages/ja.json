@@ -2100,7 +2100,8 @@
     },
     "toasts": {
       "createFailed": "プロジェクトの作成に失敗しました",
-      "createSuccess": "プロジェクトが正常に作成されました"
+      "createSuccess": "プロジェクトが正常に作成されました",
+      "openWorkspaceFailed": "プロジェクトは作成されましたが、ワークスペースで開けませんでした"
     },
     "errors": {
       "directoryExists": "対象ディレクトリは既に存在します",

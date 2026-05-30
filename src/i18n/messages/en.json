@@ -2100,7 +2100,8 @@
     },
     "toasts": {
       "createFailed": "Failed to create project",
-      "createSuccess": "Project created successfully"
+      "createSuccess": "Project created successfully",
+      "openWorkspaceFailed": "Project created, but couldn't open it in the workspace"
     },
     "errors": {
       "directoryExists": "Target directory already exists",

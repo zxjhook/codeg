@@ -2100,7 +2100,8 @@
     },
     "toasts": {
       "createFailed": "创建项目失败",
-      "createSuccess": "项目创建成功"
+      "createSuccess": "项目创建成功",
+      "openWorkspaceFailed": "项目已创建，但无法在工作区中打开"
     },
     "errors": {
       "directoryExists": "目标目录已存在",

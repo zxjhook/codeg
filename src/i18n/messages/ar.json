@@ -2100,7 +2100,8 @@
     },
     "toasts": {
       "createFailed": "فشل إنشاء المشروع",
-      "createSuccess": "تم إنشاء المشروع بنجاح"
+      "createSuccess": "تم إنشاء المشروع بنجاح",
+      "openWorkspaceFailed": "تم إنشاء المشروع، ولكن تعذّر فتحه في مساحة العمل"
     },
     "errors": {
       "directoryExists": "الدليل الهدف موجود بالفعل",

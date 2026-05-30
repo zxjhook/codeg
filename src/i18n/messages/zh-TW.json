@@ -2100,7 +2100,8 @@
     },
     "toasts": {
       "createFailed": "建立專案失敗",
-      "createSuccess": "專案建立成功"
+      "createSuccess": "專案建立成功",
+      "openWorkspaceFailed": "專案已建立，但無法在工作區中開啟"
     },
     "errors": {
       "directoryExists": "目標目錄已存在",

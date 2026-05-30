@@ -2100,7 +2100,8 @@
     },
     "toasts": {
       "createFailed": "Échec de la création du projet",
-      "createSuccess": "Projet créé avec succès"
+      "createSuccess": "Projet créé avec succès",
+      "openWorkspaceFailed": "Projet créé, mais impossible de l'ouvrir dans l'espace de travail"
     },
     "errors": {
       "directoryExists": "Le répertoire cible existe déjà",
