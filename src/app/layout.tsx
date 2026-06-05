@@ -11,6 +11,7 @@ import { toIntlLocale } from "@/lib/i18n"
 import { APPEARANCE_INIT_SCRIPT } from "@/lib/appearance-script"
 import { AppearanceProvider } from "@/components/appearance-provider"
 import { OverlayScrollbarsInit } from "@/components/overlay-scrollbars-init"
+import { ClipboardFallbackInit } from "@/components/clipboard-fallback-init"
 
 const jetbrainsMono = JetBrains_Mono({
   subsets: ["latin"],
@@ -77,6 +78,7 @@ export default async function RootLayout({
             >
               <AppearanceProvider>
                 <OverlayScrollbarsInit />
+                <ClipboardFallbackInit />
                 {children}
               </AppearanceProvider>
             </ThemeProvider>

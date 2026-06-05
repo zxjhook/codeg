@@ -28,7 +28,7 @@ import { useAppWorkspace } from "@/contexts/app-workspace-context"
 import { useTabContext } from "@/contexts/tab-context"
 import { useSessionStats } from "@/contexts/session-stats-context"
 import { useTaskContext } from "@/contexts/task-context"
-import { cn, copyTextToClipboard, randomUUID } from "@/lib/utils"
+import { cn, copyTextFromMenu, randomUUID } from "@/lib/utils"
 import { useConnectionLifecycle } from "@/hooks/use-connection-lifecycle"
 import { useMessageQueue, type QueuedMessage } from "@/hooks/use-message-queue"
 import { MessageListView } from "@/components/message/message-list-view"
@@ -1428,7 +1428,7 @@ export function ConversationDetailPanel() {
 
   const handleCopySelectedText = useCallback(async () => {
     if (!contextMenuSelectedText) return
-    const ok = await copyTextToClipboard(contextMenuSelectedText)
+    const ok = await copyTextFromMenu(contextMenuSelectedText)
     if (ok) {
       toast.success(t("copyTextSuccess"))
     } else {
