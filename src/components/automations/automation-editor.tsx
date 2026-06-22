@@ -133,6 +133,14 @@ export function AutomationEditor({
     [folders, folderId]
   )
 
+  // A folder is selected but its path hasn't resolved yet (folders list still
+  // hydrating, or the folder was removed): the agent-options probe would fall
+  // back to a global (workingDir = null) snapshot and pin the wrong folder's
+  // config. Block saving until the path is known. The run's working dir is
+  // resolved server-side from folderId regardless, so this only keeps the saved
+  // config snapshot scoped to the right folder.
+  const folderPathResolving = folderId != null && folderPath == null
+
   const referenceGroupLabels = useMemo<ReferenceGroupLabels>(
     () => ({
       file: tComposer("mentionGroupFile"),
@@ -220,6 +228,10 @@ export function AutomationEditor({
     if (!displayText) return setError(t("errorPrompt"))
     if (trigger === "schedule" && !cron.trim()) return setError(t("errorCron"))
     if (folderId == null) return setError(t("errorFolder"))
+    // Folder selected but its path is still resolving; the probe would be global.
+    // The Save button is disabled in this state, so this is a race-safety net —
+    // bail silently and let it re-enable once the path resolves.
+    if (folderPathResolving) return
 
     const blocks: PromptInputBlock[] = editor
       ? docToPromptBlocks(editor)
@@ -550,7 +562,11 @@ export function AutomationEditor({
         >
           {t("cancel")}
         </Button>
-        <Button type="button" onClick={submit} disabled={saving}>
+        <Button
+          type="button"
+          onClick={submit}
+          disabled={saving || folderPathResolving}
+        >
           {t("save")}
         </Button>
       </div>
