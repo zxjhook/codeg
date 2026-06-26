@@ -709,8 +709,16 @@ pub fn build_router(
             post(handlers::experts::experts_get_install_status),
         )
         .route(
+            "/experts_list_all_install_statuses",
+            post(handlers::experts::experts_list_all_install_statuses),
+        )
+        .route(
             "/experts_link_to_agent",
             post(handlers::experts::experts_link_to_agent),
+        )
+        .route(
+            "/experts_apply_links",
+            post(handlers::experts::experts_apply_links),
         )
         .route(
             "/experts_unlink_from_agent",
@@ -756,6 +764,14 @@ pub fn build_router(
         .route(
             "/officecli_skill_get_install_status",
             post(handlers::office_tools::officecli_skill_get_install_status),
+        )
+        .route(
+            "/officecli_skill_list_all_install_statuses",
+            post(handlers::office_tools::officecli_skill_list_all_install_statuses),
+        )
+        .route(
+            "/officecli_skill_apply_links",
+            post(handlers::office_tools::officecli_skill_apply_links),
         )
         .route(
             "/officecli_skill_read_content",

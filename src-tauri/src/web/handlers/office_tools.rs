@@ -2,7 +2,7 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::app_error::AppCommandError;
-use crate::commands::experts::ExpertInstallStatus;
+use crate::commands::experts::{ExpertInstallStatus, LinkOp, LinkOpResult};
 use crate::commands::office_tools as ot;
 use crate::commands::office_tools::{OfficecliInfo, OfficecliSkill, SkillSyncReport};
 use crate::models::agent::AgentType;
@@ -25,6 +25,12 @@ pub struct SkillAgentParams {
 pub struct RenderHtmlParams {
     pub root_path: String,
     pub path: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyLinksParams {
+    pub ops: Vec<LinkOp>,
 }
 
 pub async fn officecli_detect() -> Result<Json<OfficecliInfo>, AppCommandError> {
@@ -80,6 +86,23 @@ pub async fn officecli_skill_get_install_status(
     Json(params): Json<SkillIdParams>,
 ) -> Result<Json<Vec<ExpertInstallStatus>>, AppCommandError> {
     let result = ot::officecli_skill_get_install_status(params.skill_id)
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(result))
+}
+
+pub async fn officecli_skill_list_all_install_statuses(
+) -> Result<Json<Vec<ExpertInstallStatus>>, AppCommandError> {
+    let result = ot::officecli_skill_list_all_install_statuses()
+        .await
+        .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
+    Ok(Json(result))
+}
+
+pub async fn officecli_skill_apply_links(
+    Json(params): Json<ApplyLinksParams>,
+) -> Result<Json<Vec<LinkOpResult>>, AppCommandError> {
+    let result = ot::officecli_skill_apply_links(params.ops)
         .await
         .map_err(|e| AppCommandError::task_execution_failed(e.to_string()))?;
     Ok(Json(result))

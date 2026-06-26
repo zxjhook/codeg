@@ -2040,6 +2040,12 @@
             "brainstormingDesc": "动手前先梳理意图与需求",
             "debuggingDesc": "先定位根因再提出修复",
             "writingSkillsDesc": "创建、编辑并验证可复用技能"
+          },
+          "notEnabled": {
+            "title": "「{skill}」技能尚未对 {agent} 启用",
+            "description": "前往设置启用后即可在此使用。",
+            "action": "去启用",
+            "hint": "技能未启用"
           }
         }
       },
@@ -2729,6 +2735,57 @@
     "create": "创建",
     "save": "保存",
     "affectedRunningSessions": "{count} 个进行中的会话需重连以应用更改"
+  },
+  "SkillMatrix": {
+    "loading": "加载中…",
+    "searchPlaceholder": "按名称、ID 或描述搜索",
+    "empty": "暂无内容。",
+    "emptySearch": "没有匹配当前搜索的结果。",
+    "skillColumn": "技能",
+    "selectAll": "全选可见项",
+    "selectSkill": "选择 {name}",
+    "everything": {
+      "label": "批量",
+      "enable": "全部启用（可见）",
+      "disable": "全部禁用（可见）"
+    },
+    "columnMenu": {
+      "enableAll": "启用全部技能",
+      "disableAll": "禁用全部技能"
+    },
+    "rowMenu": {
+      "label": "对 {name} 批量操作",
+      "enableAll": "对所有 agent 启用",
+      "disableAll": "对所有 agent 禁用"
+    },
+    "bulk": {
+      "selected": "已选择 {count} 项",
+      "targetAll": "全部 agent",
+      "targetSome": "{count} 个 agent",
+      "enable": "启用",
+      "disable": "禁用",
+      "clear": "清除"
+    },
+    "confirm": {
+      "disableTitle": "禁用这些链接？",
+      "disableBody": "这将移除 {count} 个由 codeg 管理的技能链接。占用自定义目录的技能不受影响。你可以随时重新启用。",
+      "cancel": "取消",
+      "confirm": "禁用"
+    },
+    "toasts": {
+      "loadFailed": "加载技能状态失败",
+      "applyFailed": "应用更改失败",
+      "enabled": "已启用 {count} 个链接",
+      "disabled": "已禁用 {count} 个链接",
+      "enabledPartial": "已启用 {ok} 个，{failed} 个失败",
+      "disabledPartial": "已禁用 {ok} 个，{failed} 个失败"
+    },
+    "detail": {
+      "enableForAgents": "为 agent 启用",
+      "preview": "SKILL.md 预览",
+      "loadingContent": "加载内容中…"
+    },
+    "copyModeHint": "已复制（非链接）——更新后请重新启用以获取最新版本"
   },
   "ExpertsSettings": {
     "title": "专家技能",

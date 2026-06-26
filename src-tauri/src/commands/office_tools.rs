@@ -22,7 +22,7 @@ use crate::commands::acp::{
 };
 use crate::commands::experts::{
     central_experts_dir, classify_link, create_link_raw, path_is_symlink, read_link_target,
-    ExpertInstallStatus, ExpertLinkState,
+    ExpertInstallStatus, ExpertLinkState, LinkOp, LinkOpResult,
 };
 use crate::app_error::AppCommandError;
 use crate::commands::folders::resolve_tree_path;
@@ -522,13 +522,16 @@ fn supported_agents() -> Vec<AgentType> {
         .collect()
 }
 
-#[cfg_attr(feature = "tauri-runtime", tauri::command)]
-pub async fn officecli_skill_link_to_agent(
-    skill_id: String,
+/// Link one office skill into one agent's skill dir. **Assumes the mutation
+/// lock is already held** — `tokio::sync::Mutex` is not reentrant, so
+/// `officecli_skill_apply_links` locks once and calls this directly rather than
+/// the public command. The "not synced" guard stays here so a batch enable of
+/// an un-synced skill fails only that op.
+fn link_one_locked(
+    skill_id: &str,
     agent_type: AgentType,
 ) -> Result<ExpertInstallStatus, OfficeToolsError> {
-    let _guard = mutation_lock().lock().await;
-    let skill_id = validate_skill_id(&skill_id).map_err(|e| OfficeToolsError::Io(e.to_string()))?;
+    let skill_id = validate_skill_id(skill_id).map_err(|e| OfficeToolsError::Io(e.to_string()))?;
     let _ = find_skill_def(&skill_id)
         .ok_or_else(|| OfficeToolsError::SkillNotFound(skill_id.clone()))?;
 
@@ -589,12 +592,27 @@ pub async fn officecli_skill_link_to_agent(
 }
 
 #[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn officecli_skill_link_to_agent(
+    skill_id: String,
+    agent_type: AgentType,
+) -> Result<ExpertInstallStatus, OfficeToolsError> {
+    let _guard = mutation_lock().lock().await;
+    link_one_locked(&skill_id, agent_type)
+}
+
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
 pub async fn officecli_skill_unlink_from_agent(
     skill_id: String,
     agent_type: AgentType,
 ) -> Result<(), OfficeToolsError> {
     let _guard = mutation_lock().lock().await;
-    let skill_id = validate_skill_id(&skill_id).map_err(|e| OfficeToolsError::Io(e.to_string()))?;
+    unlink_one_locked(&skill_id, agent_type)
+}
+
+/// Remove one office skill's link from one agent's skill dirs. **Assumes the
+/// mutation lock is already held** (see `link_one_locked`).
+fn unlink_one_locked(skill_id: &str, agent_type: AgentType) -> Result<(), OfficeToolsError> {
+    let skill_id = validate_skill_id(skill_id).map_err(|e| OfficeToolsError::Io(e.to_string()))?;
     let _ = find_skill_def(&skill_id)
         .ok_or_else(|| OfficeToolsError::SkillNotFound(skill_id.clone()))?;
 
@@ -659,6 +677,78 @@ pub async fn officecli_skill_get_install_status(
             expected_target_path: expected.to_string_lossy().to_string(),
             copy_mode: false,
         });
+    }
+    Ok(out)
+}
+
+/// Apply a batch of enable/disable operations under a single lock acquisition.
+/// Mirrors `experts_apply_links`; an un-synced skill simply fails its own op.
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn officecli_skill_apply_links(
+    ops: Vec<LinkOp>,
+) -> Result<Vec<LinkOpResult>, OfficeToolsError> {
+    let _guard = mutation_lock().lock().await;
+    let mut out = Vec::with_capacity(ops.len());
+    for op in ops {
+        // `LinkOp.expert_id` carries the office skill id here — the field name is
+        // shared with the experts batch type, and office's ExpertInstallStatus
+        // already overloads `expert_id` as the skill id.
+        let LinkOp {
+            expert_id,
+            agent_type,
+            enable,
+        } = op;
+        let res = if enable {
+            link_one_locked(&expert_id, agent_type).map(Some)
+        } else {
+            unlink_one_locked(&expert_id, agent_type).map(|()| None)
+        };
+        out.push(match res {
+            Ok(status) => LinkOpResult {
+                expert_id,
+                agent_type,
+                ok: true,
+                status,
+                error: None,
+            },
+            Err(err) => LinkOpResult {
+                expert_id,
+                agent_type,
+                ok: false,
+                status: None,
+                error: Some(err.to_string()),
+            },
+        });
+    }
+    Ok(out)
+}
+
+/// One-shot snapshot of every (skill, agent) link state for the matrix UI.
+#[cfg_attr(feature = "tauri-runtime", tauri::command)]
+pub async fn officecli_skill_list_all_install_statuses(
+) -> Result<Vec<ExpertInstallStatus>, OfficeToolsError> {
+    let agents = supported_agents();
+    let mut out = Vec::with_capacity(skill_defs().len() * agents.len());
+    for def in skill_defs() {
+        let expected = skill_central_path(def.id);
+        for &agent in &agents {
+            let link_path = match agent_link_path(agent, def.id) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            let state = classify_link(&link_path, &expected);
+            let target_path =
+                read_link_target(&link_path).map(|p| p.to_string_lossy().to_string());
+            out.push(ExpertInstallStatus {
+                expert_id: def.id.to_string(),
+                agent_type: agent,
+                state,
+                link_path: link_path.to_string_lossy().to_string(),
+                target_path,
+                expected_target_path: expected.to_string_lossy().to_string(),
+                copy_mode: false,
+            });
+        }
     }
     Ok(out)
 }
@@ -781,4 +871,72 @@ pub async fn stop_office_watch(root_path: String, path: String) -> Result<(), Ap
     crate::office_watch::stop_office_watch_core(root_path, path)
         .await
         .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{timeout, Duration};
+
+    // Tests use unknown skill ids so they never touch the developer's real skill
+    // directories: office link/unlink both fail at `find_skill_def` for an
+    // unknown id, before any filesystem access.
+
+    #[tokio::test]
+    async fn apply_links_does_not_deadlock() {
+        // Regression guard: `officecli_skill_apply_links` must hold the
+        // (non-reentrant) lock once and call the lock-free inner helpers, not the
+        // public single commands — otherwise the second op would hang.
+        let ops = vec![
+            LinkOp {
+                expert_id: "zzz-unknown-office-skill-a".into(),
+                agent_type: AgentType::ClaudeCode,
+                enable: false,
+            },
+            LinkOp {
+                expert_id: "zzz-unknown-office-skill-b".into(),
+                agent_type: AgentType::Codex,
+                enable: false,
+            },
+        ];
+        let results = timeout(Duration::from_secs(5), officecli_skill_apply_links(ops))
+            .await
+            .expect("officecli_skill_apply_links must not deadlock")
+            .expect("batch returns Ok");
+        assert_eq!(results.len(), 2);
+        // Unknown skills fail their own op without aborting the batch.
+        assert!(results.iter().all(|r| !r.ok && r.error.is_some()), "{results:?}");
+    }
+
+    #[tokio::test]
+    async fn apply_links_collects_per_op_results_without_aborting() {
+        let ops = vec![
+            LinkOp {
+                expert_id: "zzz-unknown-office-skill".into(),
+                agent_type: AgentType::ClaudeCode,
+                enable: true,
+            },
+            LinkOp {
+                expert_id: "zzz-unknown-office-skill".into(),
+                agent_type: AgentType::Codex,
+                enable: false,
+            },
+        ];
+        let results = officecli_skill_apply_links(ops)
+            .await
+            .expect("batch returns Ok");
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| !r.ok));
+        assert!(results.iter().all(|r| r.error.is_some()));
+        assert!(results.iter().all(|r| r.status.is_none()));
+    }
+
+    #[tokio::test]
+    async fn list_all_install_statuses_covers_every_skill_agent_pair() {
+        let rows = officecli_skill_list_all_install_statuses()
+            .await
+            .expect("snapshot returns Ok");
+        let expected = skill_defs().len() * supported_agents().len();
+        assert_eq!(rows.len(), expected);
+    }
 }
