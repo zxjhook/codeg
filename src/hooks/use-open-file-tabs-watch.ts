@@ -211,7 +211,10 @@ export function useOpenFileTabsWatch({
 
     const subscriptions = targets.map(([folderId, rootPath]) => {
       const store = getWorkspaceStateStore(rootPath)
-      store.acquire()
+      // Paths-only: tab watching consumes changed_paths exclusively. The
+      // backend runs tree/git scans on this root only while an aux
+      // tree/git panel holds a full-mode token.
+      const token = store.acquire("paths")
 
       // Per-folder drainer: coalesces envelope bursts via queueMicrotask
       // and a single in-flight loop, mirroring the aux panel's original
@@ -379,7 +382,7 @@ export function useOpenFileTabsWatch({
         disposed = true
         unsubscribe()
         pendingPaths.clear()
-        store.release()
+        store.release(token)
       }
     })
 

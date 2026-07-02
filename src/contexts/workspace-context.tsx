@@ -1284,8 +1284,11 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   // aux panel tabs use. Gated on the preference: with auto-preview off we hold
   // no extra ref, leaving today's aux-panel-scoped lifecycle untouched.
   const officeAutoPreview = useOfficeAutoPreview()
+  // Paths-only subscription: this exists for changed_paths envelopes and
+  // must never be the reason a root runs tree/git scans.
   const officeWatchStore = useWorkspaceStateStore(
-    officeAutoPreview ? (folderPath ?? null) : null
+    officeAutoPreview ? (folderPath ?? null) : null,
+    "paths"
   )
   const subscribeOfficeEnvelopes = officeWatchStore.subscribeEnvelopes
   const activeFolderIdForOffice = activeFolder?.id
