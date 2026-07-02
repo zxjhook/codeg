@@ -1,106 +1,119 @@
 import { readFileSync } from "node:fs"
 import { resolve } from "node:path"
 
-const source = readFileSync(
+const auxSource = readFileSync(
   resolve(process.cwd(), "src/components/layout/aux-panel-file-tree-tab.tsx"),
   "utf8"
 )
 
-describe("aux-panel-file-tree-tab external conflict reload wiring", () => {
-  it("invokes openFilePreview with { reload: true } from handleReloadExternalConflict", () => {
-    const startMarker = "const handleReloadExternalConflict = useCallback("
-    const start = source.indexOf(startMarker)
-    expect(start).toBeGreaterThan(-1)
+const watchSource = readFileSync(
+  resolve(process.cwd(), "src/hooks/use-open-file-tabs-watch.ts"),
+  "utf8"
+)
 
-    // The callback body ends with the closing of useCallback's dependency
-    // array. Scan to the next "}, [" which closes the inner arrow function
-    // and starts the deps array — that bounds the callback we care about.
-    const end = source.indexOf("}, [", start)
-    expect(end).toBeGreaterThan(start)
+const providerSource = readFileSync(
+  resolve(process.cwd(), "src/contexts/workspace-context.tsx"),
+  "utf8"
+)
 
-    const block = source.slice(start, end)
+describe("aux-panel-file-tree-tab no longer owns tab watching", () => {
+  // The external-change reconciliation for open file tabs moved to the
+  // always-mounted provider watcher (use-open-file-tabs-watch). The aux
+  // panel is closed by default — any tab-reconciliation logic living here
+  // would silently stop working whenever the panel is closed. Lock the
+  // separation so a future change cannot quietly reintroduce it.
+  it("contains no tab reconciliation or conflict machinery", () => {
+    expect(auxSource).not.toMatch(/resolveFileChangeDecision/)
+    expect(auxSource).not.toMatch(/announceConflict/)
+    expect(auxSource).not.toMatch(/externalConflictPrompt/)
+    expect(auxSource).not.toMatch(/\bapplyExternalReload\b/)
+    expect(auxSource).not.toMatch(/\bmarkTabsStale\b/)
+    expect(auxSource).not.toMatch(/\brejectFileTab\b/)
+    expect(auxSource).not.toMatch(/\breloadOpenFileBackground\b/)
+  })
 
-    // openFilePreview must be invoked with the explicit reload option so the
-    // user's "Reload" choice bypasses the workspace-context cache hit and
-    // actually re-reads from disk, discarding the dirty buffer.
-    expect(block).toMatch(
-      /openFilePreview\([^)]*externalConflictPrompt\.path[^)]*\{[^}]*reload:\s*true[^}]*\}/
-    )
+  it("keeps the lazy-subtree cache invalidation envelope subscription", () => {
+    // This envelope use is tree-cache bookkeeping, NOT tab watching — it
+    // must stay with the tree it invalidates.
+    expect(auxSource).toMatch(/subscribeWorkspaceEnvelopes/)
+    expect(auxSource).toMatch(/lazyLoadedChildrenByPathRef/)
   })
 })
 
-describe("aux-panel-file-tree-tab external-change watcher coverage", () => {
+describe("use-open-file-tabs-watch external-change coverage", () => {
   it("destructures the background-reload, stale, and prefetched-apply APIs", () => {
     // Catching external changes for non-active tabs requires these APIs;
     // source-grep them so a future refactor cannot silently regress to
-    // active-tab-only behavior by dropping imports.
-    expect(source).toMatch(/\breloadOpenFileBackground\b/)
-    expect(source).toMatch(/\bmarkTabsStale\b/)
-    expect(source).toMatch(/\bapplyExternalReload\b/)
+    // active-tab-only behavior by dropping them.
+    expect(watchSource).toMatch(/\breloadOpenFileBackground\b/)
+    expect(watchSource).toMatch(/\bmarkTabsStaleBatch\b/)
+    expect(watchSource).toMatch(/\bapplyExternalReload\b/)
+    expect(watchSource).toMatch(/\brejectFileTab\b/)
   })
 
-  it("does not poll workspaceState.seq for change detection", () => {
-    // Seq-tick polling forces a full open-tab scan on every workspace
-    // event — regardless of relevance — and reads each file twice
-    // (resolver + reload). The change-detection watcher must instead be
-    // driven by envelope subscription. previousWorkspaceSeqRef belonged
-    // solely to the old seq-tick effect; its absence locks the change.
-    expect(source).not.toMatch(/previousWorkspaceSeqRef\b/)
+  it("keys the subscription effect on the collision-safe watch signature only", () => {
+    // Blocker #13: depending on anything derived per-render from fileTabs
+    // would tear down and rebuild every store subscription on each
+    // keystroke. The effect must key on the JSON signature string.
+    expect(watchSource).toMatch(/JSON\.stringify\(entries\)/)
+    expect(watchSource).toMatch(/JSON\.parse\(watchSignature\)/)
   })
 
-  it("dispatches applyExternalReload from the change watcher to avoid double-reads", () => {
+  it("dispatches applyExternalReload from the watcher to avoid double-reads", () => {
     // The resolver already paid for one readFileForEdit. Reloading via
     // openFilePreview would trigger a second read; applyExternalReload
     // writes the prefetched payload directly.
-    const awaitIdx = source.indexOf("await resolveFileChangeDecision(")
+    const awaitIdx = watchSource.indexOf("await resolveFileChangeDecision(")
     expect(awaitIdx).toBeGreaterThan(-1)
-    const window = source.slice(awaitIdx, awaitIdx + 2000)
+    const window = watchSource.slice(awaitIdx, awaitIdx + 2000)
     expect(window).toMatch(/applyExternalReload\s*\(/)
   })
 
-  it("re-reads the active tab id after each per-tab resolve await", () => {
-    // Stale activeId bug: capturing activeFileTabRef.current once at the
-    // start of an async scan lets a tab the user has since switched away
-    // from be re-activated by a foreground reload. The active-id check
-    // MUST dereference activeFileTabRef.current freshly inside the loop.
-    const awaitIdx = source.indexOf("await resolveFileChangeDecision(")
-    expect(awaitIdx).toBeGreaterThan(-1)
-    const window = source.slice(awaitIdx, awaitIdx + 600)
-    expect(window).toMatch(/tab\.id\s*===\s*[^=]*activeFileTabRef\.current/)
+  it("re-reads the active tab id after the conflict resolve await", () => {
+    // If the user switches away mid-read, the conflict must degrade to a
+    // stale mark instead of popping a dialog for a tab they just left.
+    expect(watchSource).toMatch(
+      /tab\.id\s*===\s*activeFileTabIdRef\.current[\s\S]{0,400}enqueueExternalConflict/
+    )
   })
 
   it("branches image tabs around the etag resolver", () => {
-    // ImagePreview tabs use readFileBase64 (no etag); the etag resolver
-    // would either fail (binary) or report a spurious mismatch, then
-    // trigger a full base64 re-read every workspace event. The watcher
-    // MUST branch on image-ness BEFORE invoking the resolver.
-    const awaitIdx = source.indexOf("await resolveFileChangeDecision(")
+    // Image tabs use readFileBase64 (no etag); the etag resolver would
+    // report a spurious mismatch and trigger a full base64 re-read every
+    // workspace event. The watcher MUST branch on image-ness BEFORE
+    // invoking the resolver.
+    const awaitIdx = watchSource.indexOf("await resolveFileChangeDecision(")
     expect(awaitIdx).toBeGreaterThan(-1)
-    const start = Math.max(0, awaitIdx - 1200)
-    const block = source.slice(start, awaitIdx)
-    expect(block).toMatch(/isImageFile|isImagePath|imageExtensions|IMAGE_EXT/i)
+    const block = watchSource.slice(Math.max(0, awaitIdx - 1600), awaitIdx)
+    expect(block).toMatch(/isImageFile/)
   })
 
   it("falls back to a full scan when an envelope signals resync_hint", () => {
-    // Targeted scanning by changed_paths is the fast path. A backend
-    // resync (or any envelope without changed_paths) must trigger a
-    // full sweep, or external changes can be missed silently.
-    expect(source).toMatch(/resync_hint/)
+    expect(watchSource).toMatch(/resync_hint/)
   })
 
   it("models a missing/read-failure decision in the resolver", () => {
-    // Silent stale content after an external delete is unacceptable. The
-    // resolver MUST surface read failure as its own decision kind so the
-    // watcher can branch into reject (clean) or mark-stale (dirty),
-    // instead of collapsing the catch into { kind: "none" }.
-    expect(source).toMatch(/kind:\s*"missing"/)
+    expect(watchSource).toMatch(/kind:\s*"missing"/)
   })
 
-  it("dispatches rejectFileTab from the change watcher for missing decisions", () => {
-    // The watcher must route the missing decision into a user-visible
-    // error path for clean tabs. markTabsStale alone covers the dirty
-    // case; rejectFileTab is required for the clean case so the buffer
-    // is not silently preserved against a now-deleted disk file.
-    expect(source).toMatch(/\brejectFileTab\b/)
+  it("batch-marks background tabs stale instead of reading them eagerly", () => {
+    // The lazy pillar: background tabs must not cost disk reads on every
+    // workspace event — one batched setState marks them stale and the
+    // activation path refreshes them.
+    expect(watchSource).toMatch(/staleBatch/)
+    expect(watchSource).toMatch(/markTabsStaleBatch\(folderId, staleBatch\)/)
+  })
+})
+
+describe("workspace-context stale-aware save guard", () => {
+  it("verifies a stale dirty tab against disk inside saveFileTab", () => {
+    // Blocker #18: every write path funnels through saveFileTab, so the
+    // guard must live there — a stale buffer is never written blindly.
+    expect(providerSource).toMatch(
+      /if \(tab\.stale && !options\?\.force\)[\s\S]{0,600}readFileForEdit\(folderPath, tab\.path\)/
+    )
+    expect(providerSource).toMatch(
+      /if \(tab\.stale && !options\?\.force\)[\s\S]{0,1200}enqueueExternalConflict/
+    )
   })
 })

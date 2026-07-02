@@ -60,6 +60,7 @@ import { TerminalPanel } from "@/components/terminal/terminal-panel"
 import { AuxPanel } from "@/components/layout/aux-panel"
 import { FileWorkspaceTabBar } from "@/components/files/file-workspace-tab-bar"
 import { FileWorkspacePanel } from "@/components/files/file-workspace-panel"
+import { ExternalConflictDialog } from "@/components/files/external-conflict-dialog"
 import { AppToaster } from "@/components/ui/app-toaster"
 import {
   DeepLinkBootstrap,
@@ -883,6 +884,9 @@ function WorkspaceLayoutInner({ children }: { children: React.ReactNode }) {
                         <TabKeysSync />
                         <DeepLinkBootstrap />
                         <PetFocusBridge />
+                        {/* Always mounted: external-change conflicts must be
+                            resolvable even with the aux file tree closed. */}
+                        <ExternalConflictDialog />
                         <SessionStatsProvider>
                           <SidebarProvider>
                             <AuxPanelProvider>

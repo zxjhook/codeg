@@ -24,15 +24,21 @@ import {
   readFileForEdit,
   readFilePreview,
   saveFileContent,
+  saveFileCopy,
 } from "@/lib/api"
 import type { FileEditContent } from "@/lib/types"
 import {
   isHtmlPreviewable,
+  isImageFile,
   isOfficePreviewable,
   languageFromPath,
 } from "@/lib/language-detect"
 import { toErrorMessage } from "@/lib/app-error"
 import { useWorkspaceStateStore } from "@/hooks/use-workspace-state-store"
+import {
+  useOpenFileTabsWatch,
+  type WorkspaceExternalConflict,
+} from "@/hooks/use-open-file-tabs-watch"
 import { useOfficeAutoPreview } from "@/lib/office-preview-prefs"
 
 export type WorkspaceMode = "conversation" | "fusion"
@@ -186,6 +192,28 @@ type WorkspaceContextValue = WorkspaceActionsValue &
   WorkspaceViewValue &
   WorkspaceFileTabsValue
 
+// External disk-vs-buffer conflicts, isolated from the high-frequency
+// fileTabs slice so the always-mounted conflict dialog costs nothing while
+// idle. Conflicts queue FIFO (multi-folder divergences can land together);
+// the head is surfaced one at a time.
+interface WorkspaceExternalConflictValue {
+  // Head of the conflict queue, or null when there is nothing to resolve.
+  externalConflict: WorkspaceExternalConflict | null
+  // "Compare": open a disk-vs-unsaved rich diff tab (uses the LATEST
+  // buffer content when the tab is still open) and dequeue.
+  compareExternalConflict: () => void
+  // "Reload": discard the buffer and refetch from disk; clears the shown
+  // signature so a subsequent identical divergence prompts again.
+  reloadExternalConflict: () => void
+  // "Save as copy": write the unsaved buffer next to the original.
+  // Resolves with the saved path (dequeues) or throws on failure (the
+  // conflict stays queued so the user can retry).
+  saveExternalConflictCopy: () => Promise<string>
+  // Close the dialog without resolving; the signature stays recorded so
+  // the same divergence does not immediately re-prompt.
+  dismissExternalConflict: () => void
+}
+
 const WorkspaceActionsContext = createContext<WorkspaceActionsValue | null>(
   null
 )
@@ -193,6 +221,20 @@ const WorkspaceViewContext = createContext<WorkspaceViewValue | null>(null)
 const WorkspaceFileTabsContext = createContext<WorkspaceFileTabsValue | null>(
   null
 )
+const WorkspaceExternalConflictContext =
+  createContext<WorkspaceExternalConflictValue | null>(null)
+
+// Queue/dedup key for one folder+path divergence. NUL separator — cannot
+// occur in either component, so distinct pairs can never collide.
+function conflictKey(folderId: number, path: string): string {
+  return `${folderId}${String.fromCharCode(0)}${normalizePath(path)}`
+}
+
+// One-shot save-echo records: our own saveFileContent writes come back as
+// watcher change events; suppress exactly one event per save (etag match,
+// clean tab, short TTL) so an autosave before a tab switch doesn't flag
+// the tab stale and force a pointless reload on switch-back.
+const SELF_WRITE_ECHO_TTL_MS = 5_000
 
 function normalizePath(path: string): string {
   return path.replace(/\\/g, "/")
@@ -206,16 +248,10 @@ function isDirtyFileTab(tab: FileWorkspaceTab): boolean {
   return tab.kind === "file" && Boolean(tab.isDirty)
 }
 
-const IMAGE_EXTENSIONS = new Set([
-  "png",
-  "jpg",
-  "jpeg",
-  "gif",
-  "svg",
-  "webp",
-  "bmp",
-  "ico",
-])
+// Re-exported for existing consumers; the implementation lives in
+// lib/language-detect so the tab watcher can use it without a runtime
+// import cycle back into this module.
+export { isImageFile } from "@/lib/language-detect"
 
 const IMAGE_MIME: Record<string, string> = {
   png: "image/png",
@@ -226,11 +262,6 @@ const IMAGE_MIME: Record<string, string> = {
   webp: "image/webp",
   bmp: "image/bmp",
   ico: "image/x-icon",
-}
-
-export function isImageFile(path: string): boolean {
-  const ext = path.split(".").pop()?.toLowerCase() ?? ""
-  return IMAGE_EXTENSIONS.has(ext)
 }
 
 function loadingTab(
@@ -307,6 +338,20 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     new Set()
   )
   const [filesMaximized, setFilesMaximized] = useState(false)
+  // FIFO queue of unresolved disk-vs-buffer divergences (head is shown by
+  // the always-mounted conflict dialog). Isolated state: never flows into
+  // the fileTabs slice, so idle cost is zero.
+  const [externalConflictQueue, setExternalConflictQueue] = useState<
+    WorkspaceExternalConflict[]
+  >([])
+  const externalConflictQueueRef = useRef<WorkspaceExternalConflict[]>([])
+  // key(folderId,path) -> last announced signature. Suppresses re-prompt
+  // flicker when repeated events report the same divergence.
+  const conflictSignatureByKeyRef = useRef<Map<string, string>>(new Map())
+  // key(folderId,path) -> etag of our own most recent save (one-shot).
+  const selfWriteEchoRef = useRef<Map<string, { etag: string; at: number }>>(
+    new Map()
+  )
   const fileTabsRef = useRef<FileWorkspaceTab[]>([])
   // Latest-state mirrors for the stable action callbacks. Actions live in a
   // context value that must NOT change identity when tabs/folder change, so
@@ -344,6 +389,45 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   useEffect(() => {
     getFolderRef.current = getFolder
   }, [getFolder])
+
+  useEffect(() => {
+    externalConflictQueueRef.current = externalConflictQueue
+  }, [externalConflictQueue])
+
+  const recordSelfWriteEcho = useCallback(
+    (folderId: number, path: string, etag: string | null | undefined) => {
+      if (!etag) return
+      selfWriteEchoRef.current.set(conflictKey(folderId, path), {
+        etag,
+        at: Date.now(),
+      })
+    },
+    []
+  )
+
+  // One-shot: a hit consumes the record, so only the single event burst
+  // produced by our own write is suppressed — any later change for the
+  // same path marks stale normally. The tab-etag equality check is done
+  // by the caller being a CLEAN tab whose etag was set by that same save.
+  const consumeSelfWriteEcho = useCallback(
+    (folderId: number, path: string): boolean => {
+      const key = conflictKey(folderId, path)
+      const record = selfWriteEchoRef.current.get(key)
+      if (!record) return false
+      selfWriteEchoRef.current.delete(key)
+      if (Date.now() - record.at > SELF_WRITE_ECHO_TTL_MS) return false
+      const tabId = buildFileTabId({
+        kind: "file",
+        folderId,
+        path: normalizePath(path),
+      })
+      const tab = fileTabsRef.current.find((t) => t.id === tabId)
+      return Boolean(
+        tab && tab.kind === "file" && !tab.isDirty && tab.etag === record.etag
+      )
+    },
+    []
+  )
 
   // Resolve the folder an opener should target: an explicitly requested
   // folder wins; otherwise the active folder. Returns null when neither
@@ -386,32 +470,6 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     setFilesMaximized((prev) => !prev)
   }, [])
 
-  // Transitional (P1, removed once per-folder watching lands): the change
-  // watcher only covers the active folder, so tabs belonging to a folder
-  // that was in the background received no external-change events. Treat
-  // every file tab of the newly-activated folder as potentially stale —
-  // activation then refetches (clean) or conflict-checks (dirty) through
-  // the existing stale machinery. Fires only on active-folder CHANGE, so
-  // tabs opened while their folder is already active are untouched.
-  const activeFolderIdForStale = activeFolder?.id
-  useEffect(() => {
-    if (activeFolderIdForStale == null) return
-    /* eslint-disable react-hooks/set-state-in-effect */
-    setFileTabs((prev) => {
-      let changed = false
-      const next = prev.map((tab) => {
-        if (tab.kind !== "file" || tab.folderId !== activeFolderIdForStale) {
-          return tab
-        }
-        if (tab.stale === true || tab.loading) return tab
-        changed = true
-        return { ...tab, stale: true }
-      })
-      return changed ? next : prev
-    })
-    /* eslint-enable react-hooks/set-state-in-effect */
-  }, [activeFolderIdForStale])
-
   const setActivePane = useCallback((nextPane: WorkspacePane) => {
     setActivePaneState((prev) => (prev === nextPane ? prev : nextPane))
   }, [])
@@ -438,6 +496,22 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
   useEffect(() => {
     if (!foldersHydrated) return
     const validFolderIds = new Set(allFolders.map((folder) => folder.id))
+
+    // Drain conflicts whose folder is gone — their compare/reload/save
+    // targets no longer exist.
+    setExternalConflictQueue((prev) => {
+      if (prev.every((conflict) => validFolderIds.has(conflict.folderId))) {
+        return prev
+      }
+      for (const conflict of prev) {
+        if (!validFolderIds.has(conflict.folderId)) {
+          conflictSignatureByKeyRef.current.delete(
+            conflictKey(conflict.folderId, conflict.path)
+          )
+        }
+      }
+      return prev.filter((conflict) => validFolderIds.has(conflict.folderId))
+    })
 
     setFileTabs((prev) => {
       if (prev.every((tab) => validFolderIds.has(tab.folderId))) return prev
@@ -879,6 +953,36 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
       return updated
     })
   }, [])
+
+  // Batch variant for the watcher's lazy background pass: N affected
+  // background tabs cost ONE setState and zero disk reads. Patches ONLY
+  // the `stale` flag — never content or any other field — so it composes
+  // safely with concurrent keystroke updaters in the same React batch.
+  const markTabsStaleBatch = useCallback(
+    (folderId: number, rawPaths: string[]) => {
+      if (rawPaths.length === 0) return
+      const tabIds = new Set(
+        rawPaths.map((rawPath) =>
+          buildFileTabId({
+            kind: "file",
+            folderId,
+            path: normalizePath(rawPath),
+          })
+        )
+      )
+      setFileTabs((prev) => {
+        let changed = false
+        const next = prev.map((tab) => {
+          if (!tabIds.has(tab.id) || tab.kind !== "file") return tab
+          if (tab.stale === true) return tab
+          changed = true
+          return { ...tab, stale: true }
+        })
+        return changed ? next : prev
+      })
+    },
+    []
+  )
 
   // Write a prefetched FileEditContent into the matching tab. The change-
   // detection watcher uses this after its resolver has already read the
@@ -1665,6 +1769,110 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     [replaceTabContent, resolveTargetFolder, t]
   )
 
+  // Queue a divergence for the conflict dialog. Deduped two ways: a
+  // signature already announced for this folder+path is dropped entirely
+  // (no flicker on repeated events); a NEW signature for an already-queued
+  // folder+path replaces that entry in place (disk moved again while the
+  // prompt waited) instead of queueing a second prompt for the same file.
+  const enqueueExternalConflict = useCallback(
+    (conflict: WorkspaceExternalConflict) => {
+      const key = conflictKey(conflict.folderId, conflict.path)
+      const shown = conflictSignatureByKeyRef.current.get(key)
+      if (shown === conflict.signature) return
+      conflictSignatureByKeyRef.current.set(key, conflict.signature)
+      setExternalConflictQueue((prev) => {
+        const idx = prev.findIndex(
+          (queued) => conflictKey(queued.folderId, queued.path) === key
+        )
+        if (idx >= 0) {
+          const next = [...prev]
+          next[idx] = conflict
+          return next
+        }
+        return [...prev, conflict]
+      })
+    },
+    []
+  )
+
+  // Dequeue the current head. `clearSignature` re-arms the dedup so the
+  // same divergence prompts again (used by "reload", which resolves it);
+  // compare/save-copy/dismiss keep the signature so the still-diverged
+  // file does not immediately re-prompt.
+  const dequeueExternalConflict = useCallback(
+    (options?: { clearSignature?: boolean }) => {
+      const head = externalConflictQueueRef.current[0]
+      if (!head) return null
+      if (options?.clearSignature) {
+        conflictSignatureByKeyRef.current.delete(
+          conflictKey(head.folderId, head.path)
+        )
+      }
+      setExternalConflictQueue((prev) =>
+        prev[0] === head ? prev.slice(1) : prev.filter((c) => c !== head)
+      )
+      return head
+    },
+    []
+  )
+
+  const compareExternalConflict = useCallback(() => {
+    const head = dequeueExternalConflict()
+    if (!head) return
+    // Prefer the LIVE buffer content over the snapshot captured when the
+    // conflict was detected — the user may have typed since.
+    const tabId = buildFileTabId({
+      kind: "file",
+      folderId: head.folderId,
+      path: normalizePath(head.path),
+    })
+    const latestTab = fileTabsRef.current.find((t) => t.id === tabId)
+    const unsavedContent =
+      latestTab && latestTab.kind === "file" && !latestTab.loading
+        ? latestTab.content
+        : head.unsavedContent
+    openExternalConflictDiff(head.path, head.diskContent, unsavedContent, {
+      folderId: head.folderId,
+    })
+  }, [dequeueExternalConflict, openExternalConflictDiff])
+
+  const reloadExternalConflict = useCallback(() => {
+    const head = dequeueExternalConflict({ clearSignature: true })
+    if (!head) return
+    void openFilePreview(head.path, {
+      reload: true,
+      folderId: head.folderId,
+    })
+  }, [dequeueExternalConflict, openFilePreview])
+
+  const saveExternalConflictCopy = useCallback(async (): Promise<string> => {
+    const head = externalConflictQueueRef.current[0]
+    if (!head) throw new Error("no external conflict to resolve")
+    const folderPath = resolveTabFolderPath(head.folderId)
+    if (!folderPath) throw new Error(t("folderUnavailable"))
+    const tabId = buildFileTabId({
+      kind: "file",
+      folderId: head.folderId,
+      path: normalizePath(head.path),
+    })
+    const latestTab = fileTabsRef.current.find(
+      (candidate) => candidate.id === tabId
+    )
+    const unsavedContent =
+      latestTab && latestTab.kind === "file" && !latestTab.loading
+        ? latestTab.content
+        : head.unsavedContent
+    // Throws on failure BEFORE dequeueing — the conflict stays queued so
+    // the user can retry or pick another resolution.
+    const result = await saveFileCopy(folderPath, head.path, unsavedContent)
+    dequeueExternalConflict()
+    return result.path
+  }, [dequeueExternalConflict, resolveTabFolderPath, t])
+
+  const dismissExternalConflict = useCallback(() => {
+    dequeueExternalConflict()
+  }, [dequeueExternalConflict])
+
   const updateActiveFileContent = useCallback((content: string) => {
     const activeId = activeFileTabIdRef.current
     if (!activeId) return
@@ -1716,6 +1924,42 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         return false
       }
 
+      // Stale-aware guard (covers EVERY write path — manual save, 5s
+      // autosave, blur/switch/close saves — because they all funnel here):
+      // `stale` means the watcher observed an external change this buffer
+      // has not reconciled against. Never write blindly over it. Verify
+      // against disk first: an equal etag proves the flag was spurious
+      // (our own save echo) and the save proceeds; a different etag is a
+      // real divergence — surface the conflict prompt and refuse the save.
+      // `force: true` (the conflict dialog's own overwrite path) bypasses.
+      if (tab.stale && !options?.force) {
+        try {
+          const latest = await readFileForEdit(folderPath, tab.path)
+          if ((latest.etag ?? null) !== (tab.etag ?? null)) {
+            enqueueExternalConflict({
+              folderId: tab.folderId,
+              path: tab.path,
+              diskContent: latest.content,
+              unsavedContent: tab.content,
+              signature: latest.etag ?? "",
+            })
+            return false
+          }
+        } catch (error) {
+          // Disk unreadable (deleted/locked). Keep the dirty buffer and
+          // fail the save visibly; the user decides via the error state.
+          const message = toErrorMessage(error)
+          setFileTabs((prev) =>
+            prev.map((candidate) =>
+              candidate.id === tabId
+                ? { ...candidate, saveState: "error", saveError: message }
+                : candidate
+            )
+          )
+          return false
+        }
+      }
+
       const contentAtSaveStart = tab.content
       const expectedEtag = options?.force ? null : (tab.etag ?? null)
 
@@ -1743,6 +1987,10 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
           t("saveRequestTimedOut")
         )
 
+        // One-shot echo record: the watcher will see this write as a
+        // change event; suppress that single event for this path.
+        recordSelfWriteEcho(tab.folderId, tab.path, result.etag)
+
         setFileTabs((prev) =>
           prev.map((candidate) => {
             if (candidate.id !== tabId || candidate.kind !== "file") {
@@ -1758,6 +2006,9 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
               lineEnding: result.line_ending,
               savedContent,
               isDirty: candidate.content !== savedContent,
+              // An optimistic-locked save succeeding means the buffer IS
+              // the disk state now — any prior stale flag is resolved.
+              stale: false,
               saveState: "idle",
               saveError: null,
             }
@@ -1781,7 +2032,7 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
         return false
       }
     },
-    [resolveTabFolderPath, t]
+    [enqueueExternalConflict, recordSelfWriteEcho, resolveTabFolderPath, t]
   )
 
   const saveActiveFile = useCallback(
@@ -1995,6 +2246,49 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
 
   const activeFilePath = activeFileTab?.path ?? null
 
+  // Once the active tab is clean and settled (e.g. the user reloaded, or a
+  // successful save resolved the divergence), any conflict recorded for
+  // its path is moot — drop it and re-arm the signature dedup.
+  useEffect(() => {
+    const tab = activeFileTab
+    if (!tab || tab.kind !== "file" || !tab.path) return
+    if (tab.loading || tab.isDirty) return
+    const key = conflictKey(tab.folderId, tab.path)
+    conflictSignatureByKeyRef.current.delete(key)
+    /* eslint-disable react-hooks/set-state-in-effect */
+    setExternalConflictQueue((prev) =>
+      prev.some(
+        (conflict) => conflictKey(conflict.folderId, conflict.path) === key
+      )
+        ? prev.filter(
+            (conflict) => conflictKey(conflict.folderId, conflict.path) !== key
+          )
+        : prev
+    )
+    /* eslint-enable react-hooks/set-state-in-effect */
+  }, [activeFileTab])
+
+  // The watcher: per-folder FS stream subscriptions for every folder with
+  // open file tabs, lazy background staleness, eager active-tab
+  // reconciliation, and stale-on-activation. Owned here (always mounted)
+  // so detection works with the aux panel closed and across all folders.
+  useOpenFileTabsWatch({
+    fileTabs,
+    fileTabsRef,
+    activeFileTabIdRef,
+    activeFileTab,
+    resolveTabFolderPath,
+    getFolder,
+    openFilePreview,
+    reloadOpenFileBackground,
+    applyExternalReload,
+    markTabsStale,
+    markTabsStaleBatch,
+    rejectFileTab,
+    enqueueExternalConflict,
+    consumeSelfWriteEcho,
+  })
+
   const toggleFileTabPreview = useCallback((tabId: string) => {
     setPreviewFileTabIds((prev) => {
       const next = new Set(prev)
@@ -2094,12 +2388,33 @@ export function WorkspaceProvider({ children }: WorkspaceProviderProps) {
     ]
   )
 
+  const externalConflictValue = useMemo<WorkspaceExternalConflictValue>(
+    () => ({
+      externalConflict: externalConflictQueue[0] ?? null,
+      compareExternalConflict,
+      reloadExternalConflict,
+      saveExternalConflictCopy,
+      dismissExternalConflict,
+    }),
+    [
+      externalConflictQueue,
+      compareExternalConflict,
+      reloadExternalConflict,
+      saveExternalConflictCopy,
+      dismissExternalConflict,
+    ]
+  )
+
   return (
     <WorkspaceActionsContext.Provider value={actions}>
       <WorkspaceViewContext.Provider value={view}>
-        <WorkspaceFileTabsContext.Provider value={fileTabsValue}>
-          {children}
-        </WorkspaceFileTabsContext.Provider>
+        <WorkspaceExternalConflictContext.Provider
+          value={externalConflictValue}
+        >
+          <WorkspaceFileTabsContext.Provider value={fileTabsValue}>
+            {children}
+          </WorkspaceFileTabsContext.Provider>
+        </WorkspaceExternalConflictContext.Provider>
       </WorkspaceViewContext.Provider>
     </WorkspaceActionsContext.Provider>
   )
@@ -2121,6 +2436,19 @@ export function useWorkspaceView(): WorkspaceViewValue {
   const ctx = useContext(WorkspaceViewContext)
   if (!ctx) {
     throw new Error("useWorkspaceView must be used within WorkspaceProvider")
+  }
+  return ctx
+}
+
+// Disk-vs-buffer conflict queue head + resolutions. Isolated slice: only
+// the always-mounted conflict dialog subscribes, and its value changes
+// only when conflicts come and go — never on tab/content churn.
+export function useWorkspaceExternalConflict(): WorkspaceExternalConflictValue {
+  const ctx = useContext(WorkspaceExternalConflictContext)
+  if (!ctx) {
+    throw new Error(
+      "useWorkspaceExternalConflict must be used within WorkspaceProvider"
+    )
   }
   return ctx
 }

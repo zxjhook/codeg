@@ -543,6 +543,18 @@ function getStore(rootPath: string): WorkspaceStateStore {
   return created
 }
 
+export type { WorkspaceStateStore }
+
+// Imperative access to the per-root refcounted store singleton, for callers
+// that manage several roots at once (the open-file-tabs watcher subscribes
+// to every folder that has open tabs). Callers MUST pair acquire()/release()
+// — the same refcount that keeps the aux panel's backend stream alive.
+// Client-only: never call during SSR/prerender (stores start backend
+// streams); call from effects.
+export function getWorkspaceStateStore(rootPath: string): WorkspaceStateStore {
+  return getStore(rootPath)
+}
+
 export function useWorkspaceStateStore(
   rootPath: string | null
 ): WorkspaceStateResult {

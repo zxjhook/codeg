@@ -4,6 +4,7 @@ import {
   WorkspaceProvider,
   useWorkspaceActions,
   useWorkspaceContext,
+  useWorkspaceExternalConflict,
   useWorkspaceFileTabs,
   useWorkspaceView,
 } from "@/contexts/workspace-context"
@@ -118,12 +119,16 @@ vi.mock("@/lib/api", () => ({
   gitDiffWithBranch: vi.fn(),
   gitShowDiff: vi.fn(),
   saveFileContent: vi.fn(),
+  saveFileCopy: vi.fn(),
 }))
 
 // Controllable workspace-state store: WorkspaceProvider subscribes to its
-// envelopes to auto-open office previews. `emitEnvelope` lets a test push a
-// changed_paths event as if the file watcher fired. `subscribeEnvelopes`
-// identity is stable so the provider's effect doesn't churn across renders.
+// envelopes to auto-open office previews (hook path), and the tab watcher
+// acquires per-root imperative stores (getWorkspaceStateStore path).
+// `emitEnvelope` pushes an event on the office/hook stream; `emitRoot`
+// pushes on a specific root's imperative store as if that folder's file
+// watcher fired. Acquire/release totals are tracked per root so tests can
+// assert subscription stability (no churn on keystrokes).
 const workspaceStoreMock = vi.hoisted(() => {
   type EnvelopeListener = (env: {
     seq: number
@@ -131,6 +136,46 @@ const workspaceStoreMock = vi.hoisted(() => {
     changed_paths: string[]
   }) => void
   const listeners = new Set<EnvelopeListener>()
+  interface FakeRootStore {
+    acquired: number
+    acquireCalls: number
+    listeners: Set<EnvelopeListener>
+    store: {
+      acquire: () => void
+      release: () => void
+      subscribeEnvelopes: (listener: EnvelopeListener) => () => void
+    }
+  }
+  const storeByRoot = new Map<string, FakeRootStore>()
+  const getRootEntry = (rootPath: string): FakeRootStore => {
+    let entry = storeByRoot.get(rootPath)
+    if (!entry) {
+      const rootListeners = new Set<EnvelopeListener>()
+      const created: FakeRootStore = {
+        acquired: 0,
+        acquireCalls: 0,
+        listeners: rootListeners,
+        store: {
+          acquire: () => {
+            created.acquired += 1
+            created.acquireCalls += 1
+          },
+          release: () => {
+            created.acquired -= 1
+          },
+          subscribeEnvelopes: (listener: EnvelopeListener) => {
+            rootListeners.add(listener)
+            return () => {
+              rootListeners.delete(listener)
+            }
+          },
+        },
+      }
+      entry = created
+      storeByRoot.set(rootPath, entry)
+    }
+    return entry
+  }
   return {
     subscribeEnvelopes: (listener: EnvelopeListener) => {
       listeners.add(listener)
@@ -143,7 +188,26 @@ const workspaceStoreMock = vi.hoisted(() => {
         listener({ seq: 1, kind: "fs_change", changed_paths })
       }
     },
-    reset: () => listeners.clear(),
+    getStore: (rootPath: string) => getRootEntry(rootPath).store,
+    emitRoot: (
+      rootPath: string,
+      changed_paths: string[],
+      kind = "fs_change"
+    ) => {
+      const entry = storeByRoot.get(rootPath)
+      if (!entry) return
+      for (const listener of [...entry.listeners]) {
+        listener({ seq: 1, kind, changed_paths })
+      }
+    },
+    acquiredCount: (rootPath: string) =>
+      storeByRoot.get(rootPath)?.acquired ?? 0,
+    acquireCalls: (rootPath: string) =>
+      storeByRoot.get(rootPath)?.acquireCalls ?? 0,
+    reset: () => {
+      listeners.clear()
+      storeByRoot.clear()
+    },
   }
 })
 
@@ -162,7 +226,13 @@ vi.mock("@/hooks/use-workspace-state-store", () => ({
     restart: async () => {},
     subscribeEnvelopes: workspaceStoreMock.subscribeEnvelopes,
   }),
+  getWorkspaceStateStore: (rootPath: string) =>
+    workspaceStoreMock.getStore(rootPath),
 }))
+
+beforeEach(() => {
+  workspaceStoreMock.reset()
+})
 
 const mockedApi = api as unknown as {
   readFileForEdit: ReturnType<typeof vi.fn>
@@ -873,7 +943,7 @@ describe("background reload + stale semantics", () => {
     expect(mockedApi.readFileForEdit).toHaveBeenCalledTimes(3)
   })
 
-  it("markTabsStale flips stale=true on the matching tab", async () => {
+  it("markTabsStale flips stale=true on the matching non-active tab", async () => {
     mockedApi.readFileForEdit.mockResolvedValue({
       path: "a.ts",
       content: "a-v1",
@@ -890,15 +960,21 @@ describe("background reload + stale semantics", () => {
       </WorkspaceProvider>
     )
 
+    // Open A, then B — A becomes a background tab. (Marking the ACTIVE
+    // tab stale is immediately auto-resolved by the provider watcher's
+    // stale-on-activation pass, so the flag would not stay observable.)
     await act(async () => {
       screen.getByText("open-a").click()
     })
-    expect(snap.tabs[0]?.stale).toBe(false)
+    await act(async () => {
+      screen.getByText("open-b").click()
+    })
+    expect(snap.tabs.find((t) => t.id === "file:1:a.ts")?.stale).toBe(false)
 
     await act(async () => {
       screen.getByText("stale-a").click()
     })
-    expect(snap.tabs[0]?.stale).toBe(true)
+    expect(snap.tabs.find((t) => t.id === "file:1:a.ts")?.stale).toBe(true)
   })
 
   it("activates a stale clean tab and refetches as if reload:true was passed", async () => {
@@ -976,6 +1052,17 @@ describe("background reload + stale semantics", () => {
         readonly: false,
         line_ending: "lf",
       })
+      // Conflict-detection read fired by stale-on-activation for the
+      // dirty tab: disk is UNCHANGED (same etag), so no conflict and no
+      // content overwrite.
+      .mockResolvedValueOnce({
+        path: "a.ts",
+        content: "a-v1",
+        etag: "ea1",
+        mtime_ms: 1,
+        readonly: false,
+        line_ending: "lf",
+      })
 
     let snap: BackgroundProbeSnapshot = { activeId: null, tabs: [] }
     render(
@@ -999,7 +1086,8 @@ describe("background reload + stale semantics", () => {
 
     const callsBefore = mockedApi.readFileForEdit.mock.calls.length
 
-    // Activate the dirty stale tab. Must NOT refetch (would clobber edits).
+    // Activate the dirty stale tab. The watcher runs ONE conflict-check
+    // read (never a content refetch) — unsaved edits must survive.
     await act(async () => {
       screen.getByText("switch-a").click()
     })
@@ -1009,7 +1097,7 @@ describe("background reload + stale semantics", () => {
     expect(tabA?.isDirty).toBe(true)
     expect(tabA?.content).toBe("dirty-local")
     expect(tabA?.stale).toBe(true)
-    expect(mockedApi.readFileForEdit.mock.calls.length).toBe(callsBefore)
+    expect(mockedApi.readFileForEdit.mock.calls.length).toBe(callsBefore + 1)
   })
 
   it("reloadOpenFileBackground is a no-op when the path is not open", async () => {
@@ -1225,14 +1313,23 @@ describe("applyExternalReload prefetched-write semantics", () => {
   })
 
   it("clears stale=true on a successful apply", async () => {
-    mockedApi.readFileForEdit.mockResolvedValueOnce({
-      path: "a.ts",
-      content: "a-v1",
-      etag: "ea1",
-      mtime_ms: 1,
-      readonly: false,
-      line_ending: "lf",
-    })
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce({
+        path: "a.ts",
+        content: "a-v1",
+        etag: "ea1",
+        mtime_ms: 1,
+        readonly: false,
+        line_ending: "lf",
+      })
+      .mockResolvedValueOnce({
+        path: "b.ts",
+        content: "b-v1",
+        etag: "eb1",
+        mtime_ms: 1,
+        readonly: false,
+        line_ending: "lf",
+      })
 
     let snap: ApplyExternalProbeSnapshot = { activeId: null, tabs: [] }
     render(
@@ -1241,8 +1338,13 @@ describe("applyExternalReload prefetched-write semantics", () => {
       </WorkspaceProvider>
     )
 
+    // A must be a BACKGROUND tab when marked stale — an active clean
+    // stale tab is auto-reloaded by the watcher before apply could run.
     await act(async () => {
       screen.getByText("open-a").click()
+    })
+    await act(async () => {
+      screen.getByText("open-b").click()
     })
     await act(async () => {
       screen.getByText("stale-a").click()
@@ -2311,5 +2413,314 @@ describe("file tabs decoupled from the active folder", () => {
       stale: true,
       content: "dirty-local",
     })
+  })
+})
+
+function ConflictProbe() {
+  const { externalConflict } = useWorkspaceExternalConflict()
+  return (
+    <output data-testid="conflict-head">
+      {externalConflict
+        ? `${externalConflict.folderId}:${externalConflict.path}`
+        : "none"}
+    </output>
+  )
+}
+
+function WatcherProbe({
+  onCapture,
+}: {
+  onCapture: (snapshot: DecoupleSnapshot) => void
+}) {
+  const {
+    openFilePreview,
+    fileTabs,
+    activeFileTabId,
+    updateActiveFileContent,
+    saveActiveFile,
+    markTabsStale,
+  } = useWorkspaceContext()
+  onCapture({
+    activeId: activeFileTabId,
+    tabs: fileTabs.map((tab) => ({
+      id: tab.id,
+      folderId: tab.folderId,
+      content: tab.content,
+      isDirty: Boolean(tab.isDirty),
+      stale: Boolean(tab.stale),
+    })),
+  })
+  return (
+    <div>
+      <button onClick={() => void openFilePreview("a.ts")}>open-a-f1</button>
+      <button onClick={() => void openFilePreview("a.ts", { folderId: 2 })}>
+        open-a-f2
+      </button>
+      <button onClick={() => updateActiveFileContent("dirty-local")}>
+        edit
+      </button>
+      <button onClick={() => void saveActiveFile()}>save</button>
+      <button onClick={() => markTabsStale(1, "a.ts")}>stale-a-f1</button>
+    </div>
+  )
+}
+
+describe("provider tab watcher (per-folder streams, lazy staleness)", () => {
+  beforeEach(() => {
+    mockedApi.readFileForEdit.mockReset()
+    mockedApi.gitIsTracked.mockReset()
+    mockedApi.gitShowFile.mockReset()
+    mockedApi.saveFileContent.mockReset()
+    mockedApi.gitIsTracked.mockResolvedValue(false)
+    mockedApi.readFileForEdit.mockImplementation((root: string) =>
+      Promise.resolve({
+        path: "a.ts",
+        content: root === "/repo2" ? "from-repo2" : "from-repo1",
+        etag: root === "/repo2" ? "e2" : "e1",
+        mtime_ms: 1,
+        readonly: false,
+        line_ending: "lf",
+      })
+    )
+  })
+
+  function renderWatcher() {
+    let snap: DecoupleSnapshot = { activeId: null, tabs: [] }
+    render(
+      <WorkspaceProvider>
+        <WatcherProbe onCapture={(s) => (snap = s)} />
+        <ConflictProbe />
+      </WorkspaceProvider>
+    )
+    return () => snap
+  }
+
+  it("acquires one refcount per folder with open tabs and releases on close, without keystroke churn", async () => {
+    renderWatcher()
+
+    await act(async () => {
+      screen.getByText("open-a-f1").click()
+    })
+    expect(workspaceStoreMock.acquiredCount("/repo")).toBe(1)
+    const callsAfterOpen = workspaceStoreMock.acquireCalls("/repo")
+
+    // Keystrokes mutate fileTabs every render — the watch signature is
+    // unchanged, so the subscription must NOT be rebuilt (blocker #13).
+    await act(async () => {
+      screen.getByText("edit").click()
+    })
+    await act(async () => {
+      screen.getByText("edit").click()
+    })
+    expect(workspaceStoreMock.acquireCalls("/repo")).toBe(callsAfterOpen)
+
+    await act(async () => {
+      screen.getByText("open-a-f2").click()
+    })
+    expect(workspaceStoreMock.acquiredCount("/repo")).toBe(1)
+    expect(workspaceStoreMock.acquiredCount("/repo2")).toBe(1)
+  })
+
+  it("marks a background folder's tab stale on its envelope without any disk read", async () => {
+    const snap = renderWatcher()
+
+    await act(async () => {
+      screen.getByText("open-a-f1").click()
+    })
+    await act(async () => {
+      screen.getByText("open-a-f2").click()
+    })
+    expect(snap().activeId).toBe("file:2:a.ts")
+    const readsBefore = mockedApi.readFileForEdit.mock.calls.length
+
+    await act(async () => {
+      workspaceStoreMock.emitRoot("/repo", ["a.ts"])
+    })
+
+    const tabF1 = snap().tabs.find((t) => t.id === "file:1:a.ts")
+    expect(tabF1?.stale).toBe(true)
+    expect(tabF1?.content).toBe("from-repo1")
+    // The lazy pillar: zero reads for background tabs.
+    expect(mockedApi.readFileForEdit.mock.calls.length).toBe(readsBefore)
+  })
+
+  it("eagerly reconciles the ACTIVE tab on its folder's envelope (clean → in-place reload)", async () => {
+    const snap = renderWatcher()
+
+    await act(async () => {
+      screen.getByText("open-a-f1").click()
+    })
+    expect(snap().tabs[0]?.content).toBe("from-repo1")
+
+    mockedApi.readFileForEdit.mockResolvedValueOnce({
+      path: "a.ts",
+      content: "external-v2",
+      etag: "e-ext",
+      mtime_ms: 2,
+      readonly: false,
+      line_ending: "lf",
+    })
+
+    await act(async () => {
+      workspaceStoreMock.emitRoot("/repo", ["a.ts"])
+    })
+
+    const tabA = snap().tabs.find((t) => t.id === "file:1:a.ts")
+    expect(tabA?.content).toBe("external-v2")
+    expect(tabA?.stale).toBe(false)
+    expect(snap().activeId).toBe("file:1:a.ts")
+  })
+
+  it("queues a conflict for the ACTIVE dirty tab instead of clobbering the buffer", async () => {
+    const snap = renderWatcher()
+
+    await act(async () => {
+      screen.getByText("open-a-f1").click()
+    })
+    await act(async () => {
+      screen.getByText("edit").click()
+    })
+
+    mockedApi.readFileForEdit.mockResolvedValueOnce({
+      path: "a.ts",
+      content: "disk-v2",
+      etag: "e-ext",
+      mtime_ms: 2,
+      readonly: false,
+      line_ending: "lf",
+    })
+
+    await act(async () => {
+      workspaceStoreMock.emitRoot("/repo", ["a.ts"])
+    })
+
+    expect(screen.getByTestId("conflict-head")).toHaveTextContent("1:a.ts")
+    const tabA = snap().tabs.find((t) => t.id === "file:1:a.ts")
+    expect(tabA?.content).toBe("dirty-local")
+    expect(tabA?.isDirty).toBe(true)
+  })
+
+  it("treats a resync_hint as a full sweep for that folder only", async () => {
+    const snap = renderWatcher()
+
+    await act(async () => {
+      screen.getByText("open-a-f1").click()
+    })
+    await act(async () => {
+      screen.getByText("open-a-f2").click()
+    })
+    expect(snap().activeId).toBe("file:2:a.ts")
+
+    await act(async () => {
+      workspaceStoreMock.emitRoot("/repo", [], "resync_hint")
+    })
+
+    expect(snap().tabs.find((t) => t.id === "file:1:a.ts")?.stale).toBe(true)
+    // The other folder's tab is untouched — sweeps are per-stream.
+    expect(snap().tabs.find((t) => t.id === "file:2:a.ts")?.stale).toBe(false)
+  })
+})
+
+describe("stale-aware save guard (all write paths funnel through saveFileTab)", () => {
+  beforeEach(() => {
+    mockedApi.readFileForEdit.mockReset()
+    mockedApi.gitIsTracked.mockReset()
+    mockedApi.gitShowFile.mockReset()
+    mockedApi.saveFileContent.mockReset()
+    mockedApi.gitIsTracked.mockResolvedValue(false)
+  })
+
+  function renderGuard() {
+    let snap: DecoupleSnapshot = { activeId: null, tabs: [] }
+    render(
+      <WorkspaceProvider>
+        <WatcherProbe onCapture={(s) => (snap = s)} />
+        <ConflictProbe />
+      </WorkspaceProvider>
+    )
+    return () => snap
+  }
+
+  it("refuses to save a stale dirty tab whose disk diverged, surfacing the conflict", async () => {
+    // Open (etag e1) — later reads keep reporting a DIVERGED disk (e-div).
+    mockedApi.readFileForEdit
+      .mockResolvedValueOnce({
+        path: "a.ts",
+        content: "v1",
+        etag: "e1",
+        mtime_ms: 1,
+        readonly: false,
+        line_ending: "lf",
+      })
+      .mockResolvedValue({
+        path: "a.ts",
+        content: "disk-v2",
+        etag: "e-div",
+        mtime_ms: 2,
+        readonly: false,
+        line_ending: "lf",
+      })
+    const snap = renderGuard()
+
+    await act(async () => {
+      screen.getByText("open-a-f1").click()
+    })
+    await act(async () => {
+      screen.getByText("edit").click()
+    })
+    await act(async () => {
+      screen.getByText("stale-a-f1").click()
+    })
+
+    await act(async () => {
+      screen.getByText("save").click()
+    })
+
+    // Blind write refused: no saveFileContent, buffer intact, conflict up.
+    expect(mockedApi.saveFileContent).not.toHaveBeenCalled()
+    const tabA = snap().tabs.find((t) => t.id === "file:1:a.ts")
+    expect(tabA?.content).toBe("dirty-local")
+    expect(tabA?.isDirty).toBe(true)
+    expect(screen.getByTestId("conflict-head")).toHaveTextContent("1:a.ts")
+  })
+
+  it("proceeds with the save when the stale flag proves spurious (etag equal)", async () => {
+    // Disk never changed: every read reports etag e1.
+    mockedApi.readFileForEdit.mockResolvedValue({
+      path: "a.ts",
+      content: "v1",
+      etag: "e1",
+      mtime_ms: 1,
+      readonly: false,
+      line_ending: "lf",
+    })
+    mockedApi.saveFileContent.mockResolvedValue({
+      path: "a.ts",
+      etag: "e-saved",
+      mtime_ms: 3,
+      readonly: false,
+      line_ending: "lf",
+    })
+    const snap = renderGuard()
+
+    await act(async () => {
+      screen.getByText("open-a-f1").click()
+    })
+    await act(async () => {
+      screen.getByText("edit").click()
+    })
+    await act(async () => {
+      screen.getByText("stale-a-f1").click()
+    })
+
+    await act(async () => {
+      screen.getByText("save").click()
+    })
+
+    expect(mockedApi.saveFileContent).toHaveBeenCalledTimes(1)
+    const tabA = snap().tabs.find((t) => t.id === "file:1:a.ts")
+    expect(tabA?.isDirty).toBe(false)
+    expect(tabA?.stale).toBe(false)
+    expect(screen.getByTestId("conflict-head")).toHaveTextContent("none")
   })
 })
