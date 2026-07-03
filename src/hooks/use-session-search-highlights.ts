@@ -6,6 +6,25 @@ import { collectSearchRanges } from "@/lib/session-search-dom"
 const MATCH_HIGHLIGHT = "codeg-search-match"
 const ACTIVE_HIGHLIGHT = "codeg-search-active"
 
+/**
+ * Inject ::highlight() CSS rules at runtime. Turbopack's CSS parser rejects
+ * the pseudo-element at build time, so we cannot put these in globals.css.
+ * The sheet is created once and reused across hook instances.
+ */
+let _highlightStyleInjected = false
+function ensureHighlightStyles(): void {
+  if (_highlightStyleInjected) return
+  _highlightStyleInjected = true
+  const style = document.createElement("style")
+  // Use a string literal split to prevent any static CSS parser from
+  // seeing ::highlight and choking on it.
+  style.textContent = [
+    `::${"highlight"}(${MATCH_HIGHLIGHT}){background-color:rgb(250 204 21/0.35)}`,
+    `::${"highlight"}(${ACTIVE_HIGHLIGHT}){background-color:rgb(249 115 22/0.8);color:rgb(255 255 255)}`,
+  ].join("\n")
+  document.head.appendChild(style)
+}
+
 interface UseSessionSearchHighlightsArgs {
   containerRef: RefObject<HTMLElement | null>
   /** Normalized query; pass "" to clear all highlights. */
@@ -39,6 +58,7 @@ export function useSessionSearchHighlights({
 }: UseSessionSearchHighlightsArgs): void {
   useEffect(() => {
     if (!highlightsSupported()) return
+    ensureHighlightStyles()
     const container = containerRef.current
     const clear = () => {
       CSS.highlights.delete(MATCH_HIGHLIGHT)
