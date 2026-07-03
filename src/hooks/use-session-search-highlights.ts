@@ -34,12 +34,11 @@ function ensureHighlightStyles(): void {
 let registryOwner: symbol | null = null
 
 /**
- * Ownership token for the fallback path's document selection, mirroring
- * `registryOwner`: only the instance that last selected a match may clear the
- * selection, so a user-made text selection is never clobbered by an idle
- * hook instance.
+ * Marks the fallback path's overlay element. The overlay lives inside each
+ * instance's own container, so unlike the highlight registry it needs no
+ * cross-instance ownership token.
  */
-let selectionOwner: symbol | null = null
+const OVERLAY_ATTR = "data-search-active-overlay"
 
 interface UseSessionSearchHighlightsArgs {
   containerRef: RefObject<HTMLElement | null>
@@ -64,9 +63,11 @@ function highlightsSupported(): boolean {
  * CSS Custom Highlight API. Ranges are recomputed from the live DOM on every
  * relevant mutation (virtua mounts/unmounts rows while scrolling), coalesced
  * to one repaint per animation frame. When the API is unavailable (WebKit
- * < 17.2, i.e. macOS <= 14.1 WKWebView) it falls back to selecting the ACTIVE
- * match with the native Selection API — other matches stay unmarked, but the
- * user still sees where each jump landed.
+ * < 17.2, i.e. macOS <= 14.1 WKWebView) it falls back to drawing a positioned
+ * overlay box over the ACTIVE match — other matches stay unmarked, but the
+ * user still sees where each jump landed. The fallback must never touch the
+ * document selection: the search input's caret IS the selection, so stealing
+ * it breaks typing.
  *
  * Ownership: only the instance currently painting highlights may clear the
  * registry. Instances with an empty query never touch the registry unless they
@@ -83,48 +84,79 @@ export function useSessionSearchHighlights({
 
   useEffect(() => {
     if (!highlightsSupported()) {
-      const token = tokenRef.current
       const container = containerRef.current
 
-      const clearSelectionIfOwner = () => {
-        if (selectionOwner === token) {
-          window.getSelection()?.removeAllRanges()
-          selectionOwner = null
-        }
+      const removeOverlay = () => {
+        container
+          ?.querySelectorAll(`[${OVERLAY_ATTR}]`)
+          .forEach((el) => el.remove())
       }
 
       if (!container || query.length === 0 || activeItemKey == null) {
-        clearSelectionIfOwner()
+        removeOverlay()
         return
       }
 
+      // One overlay layer per container, spanning it fully so child boxes can
+      // use container-relative coordinates. pointer-events: none keeps text
+      // selection and clicks working underneath.
+      let overlay = container.querySelector<HTMLElement>(`[${OVERLAY_ATTR}]`)
+      if (!overlay) {
+        overlay = document.createElement("div")
+        overlay.setAttribute(OVERLAY_ATTR, "")
+        overlay.style.cssText =
+          "position:absolute;inset:0;pointer-events:none;z-index:15;overflow:hidden"
+        container.appendChild(overlay)
+      }
+
       let frame: number | null = null
-      let attempts = 0
-      const applySelection = () => {
+      const apply = () => {
         frame = null
+        const layer = overlay
+        if (!layer) return
+        layer.replaceChildren()
         const { byItemKey } = collectSearchRanges(container, query)
         const group = byItemKey.get(activeItemKey)
-        if (group && group.length > 0) {
-          const range = group[Math.min(activeOrdinal, group.length - 1)]
-          const selection = window.getSelection()
-          if (selection) {
-            selectionOwner = token
-            selection.removeAllRanges()
-            selection.addRange(range)
-          }
-          return
-        }
-        // Right after scrollToIndex the virtualized target row may not be
-        // mounted yet; retry across a few frames until it appears.
-        if (attempts < 30) {
-          attempts += 1
-          frame = requestAnimationFrame(applySelection)
+        if (!group || group.length === 0) return
+        const range = group[Math.min(activeOrdinal, group.length - 1)]
+        const containerRect = container.getBoundingClientRect()
+        for (const rect of Array.from(range.getClientRects())) {
+          const box = document.createElement("div")
+          box.style.cssText =
+            "position:absolute;border-radius:2px;" +
+            "background-color:rgb(249 115 22/0.4);" +
+            `top:${rect.top - containerRect.top}px;` +
+            `left:${rect.left - containerRect.left}px;` +
+            `width:${rect.width}px;height:${rect.height}px`
+          layer.appendChild(box)
         }
       }
-      applySelection()
+      const schedule = () => {
+        if (frame == null) frame = requestAnimationFrame(apply)
+      }
+
+      apply()
+      // Reposition when virtua mounts/unmounts rows or streaming reflows the
+      // content — but ignore our own overlay writes to avoid an observer loop.
+      const observer = new MutationObserver((records) => {
+        if (records.every((r) => overlay?.contains(r.target))) return
+        schedule()
+      })
+      observer.observe(container, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      })
+      // The inner virtua scroller moves content under the overlay; capture
+      // phase catches its scroll events without knowing which element scrolls.
+      container.addEventListener("scroll", schedule, true)
+      window.addEventListener("resize", schedule)
       return () => {
+        observer.disconnect()
+        container.removeEventListener("scroll", schedule, true)
+        window.removeEventListener("resize", schedule)
         if (frame != null) cancelAnimationFrame(frame)
-        clearSelectionIfOwner()
+        removeOverlay()
       }
     }
     ensureHighlightStyles()

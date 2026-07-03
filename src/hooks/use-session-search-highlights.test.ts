@@ -1,11 +1,14 @@
-import { describe, it, expect, beforeEach } from "vitest"
+import { describe, it, expect, beforeEach, vi } from "vitest"
 import { renderHook } from "@testing-library/react"
 import { useSessionSearchHighlights } from "@/hooks/use-session-search-highlights"
 
 // jsdom has no CSS.highlights / Highlight, so these tests exercise the
 // fallback path used by WebKit < 17.2 (macOS <= 14.1 WKWebView): the hook
-// selects the active match with the native Selection API instead of painting
-// CSS highlights.
+// draws a positioned overlay box over the active match. It must never touch
+// the document selection — the search input's caret IS the selection, so
+// stealing it breaks typing.
+
+const OVERLAY_SELECTOR = "[data-search-active-overlay]"
 
 function buildContainer(): HTMLElement {
   const root = document.createElement("div")
@@ -17,19 +20,22 @@ function buildContainer(): HTMLElement {
   return root
 }
 
-function currentSelection(): Selection {
-  const selection = window.getSelection()
-  if (!selection) throw new Error("jsdom returned no selection")
-  return selection
+// jsdom does no layout: getClientRects always returns an empty list. Stub a
+// single rect so the overlay path has geometry to draw.
+function stubRangeRects(): void {
+  vi.spyOn(Range.prototype, "getClientRects").mockReturnValue([
+    { top: 40, left: 12, width: 50, height: 16 },
+  ] as unknown as DOMRectList)
 }
 
 beforeEach(() => {
   document.body.innerHTML = ""
-  currentSelection().removeAllRanges()
+  vi.restoreAllMocks()
 })
 
-describe("useSessionSearchHighlights selection fallback", () => {
-  it("selects the active match when CSS highlights are unavailable", () => {
+describe("useSessionSearchHighlights overlay fallback", () => {
+  it("draws an overlay box over the active match", () => {
+    stubRangeRects()
     const root = buildContainer()
     renderHook(() =>
       useSessionSearchHighlights({
@@ -39,28 +45,36 @@ describe("useSessionSearchHighlights selection fallback", () => {
         activeOrdinal: 1,
       })
     )
-    const selection = currentSelection()
-    expect(selection.rangeCount).toBe(1)
-    const range = selection.getRangeAt(0)
-    expect(range.toString().toLowerCase()).toBe("world")
-    // Second occurrence of "world" in "hello world and world".
-    expect(range.startOffset).toBe(16)
+    const overlay = root.querySelector<HTMLElement>(OVERLAY_SELECTOR)
+    expect(overlay).not.toBeNull()
+    const box = overlay!.firstElementChild as HTMLElement
+    expect(box).not.toBeNull()
+    // Container rect is all zeros in jsdom, so box coords equal the rect's.
+    expect(box.style.top).toBe("40px")
+    expect(box.style.left).toBe("12px")
+    expect(box.style.width).toBe("50px")
+    expect(box.style.height).toBe("16px")
   })
 
-  it("clamps the active ordinal to the last occurrence", () => {
+  it("never touches the document selection", () => {
+    stubRangeRects()
     const root = buildContainer()
+    const removeSpy = vi.spyOn(Selection.prototype, "removeAllRanges")
+    const addSpy = vi.spyOn(Selection.prototype, "addRange")
     renderHook(() =>
       useSessionSearchHighlights({
         containerRef: { current: root },
         query: "world",
         activeItemKey: "k1",
-        activeOrdinal: 99,
+        activeOrdinal: 0,
       })
     )
-    expect(currentSelection().getRangeAt(0).startOffset).toBe(16)
+    expect(removeSpy).not.toHaveBeenCalled()
+    expect(addSpy).not.toHaveBeenCalled()
   })
 
-  it("clears its own selection when the query empties", () => {
+  it("removes the overlay when the query empties", () => {
+    stubRangeRects()
     const root = buildContainer()
     const { rerender } = renderHook(
       ({ query }: { query: string }) =>
@@ -72,12 +86,13 @@ describe("useSessionSearchHighlights selection fallback", () => {
         }),
       { initialProps: { query: "world" } }
     )
-    expect(currentSelection().rangeCount).toBe(1)
+    expect(root.querySelector(OVERLAY_SELECTOR)).not.toBeNull()
     rerender({ query: "" })
-    expect(currentSelection().rangeCount).toBe(0)
+    expect(root.querySelector(OVERLAY_SELECTOR)).toBeNull()
   })
 
-  it("clears its own selection on unmount", () => {
+  it("removes the overlay on unmount", () => {
+    stubRangeRects()
     const root = buildContainer()
     const { unmount } = renderHook(() =>
       useSessionSearchHighlights({
@@ -87,32 +102,23 @@ describe("useSessionSearchHighlights selection fallback", () => {
         activeOrdinal: 0,
       })
     )
-    expect(currentSelection().rangeCount).toBe(1)
+    expect(root.querySelector(OVERLAY_SELECTOR)).not.toBeNull()
     unmount()
-    expect(currentSelection().rangeCount).toBe(0)
+    expect(root.querySelector(OVERLAY_SELECTOR)).toBeNull()
   })
 
-  it("does not clobber a selection it did not create", () => {
+  it("draws no box when the active item has no rendered match", () => {
+    stubRangeRects()
     const root = buildContainer()
-    // A user-made selection elsewhere on the page.
-    const userNode = document.createElement("p")
-    userNode.textContent = "user selected text"
-    document.body.appendChild(userNode)
-    const userRange = document.createRange()
-    userRange.selectNodeContents(userNode)
-    currentSelection().addRange(userRange)
-
     renderHook(() =>
       useSessionSearchHighlights({
         containerRef: { current: root },
-        query: "",
-        activeItemKey: null,
+        query: "world",
+        activeItemKey: "missing-item",
         activeOrdinal: 0,
       })
     )
-    expect(currentSelection().rangeCount).toBe(1)
-    expect(currentSelection().getRangeAt(0).toString()).toBe(
-      "user selected text"
-    )
+    const overlay = root.querySelector<HTMLElement>(OVERLAY_SELECTOR)
+    expect(overlay?.childElementCount ?? 0).toBe(0)
   })
 })
