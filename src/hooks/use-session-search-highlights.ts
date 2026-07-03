@@ -33,6 +33,14 @@ function ensureHighlightStyles(): void {
  */
 let registryOwner: symbol | null = null
 
+/**
+ * Ownership token for the fallback path's document selection, mirroring
+ * `registryOwner`: only the instance that last selected a match may clear the
+ * selection, so a user-made text selection is never clobbered by an idle
+ * hook instance.
+ */
+let selectionOwner: symbol | null = null
+
 interface UseSessionSearchHighlightsArgs {
   containerRef: RefObject<HTMLElement | null>
   /** Normalized query; pass "" to clear all highlights. */
@@ -55,8 +63,10 @@ function highlightsSupported(): boolean {
  * Paints search-hit highlights over the virtualized message list using the
  * CSS Custom Highlight API. Ranges are recomputed from the live DOM on every
  * relevant mutation (virtua mounts/unmounts rows while scrolling), coalesced
- * to one repaint per animation frame. Silently does nothing when the API is
- * unavailable — search then degrades to scroll-only.
+ * to one repaint per animation frame. When the API is unavailable (WebKit
+ * < 17.2, i.e. macOS <= 14.1 WKWebView) it falls back to selecting the ACTIVE
+ * match with the native Selection API — other matches stay unmarked, but the
+ * user still sees where each jump landed.
  *
  * Ownership: only the instance currently painting highlights may clear the
  * registry. Instances with an empty query never touch the registry unless they
@@ -72,7 +82,51 @@ export function useSessionSearchHighlights({
   const tokenRef = useRef<symbol>(Symbol())
 
   useEffect(() => {
-    if (!highlightsSupported()) return
+    if (!highlightsSupported()) {
+      const token = tokenRef.current
+      const container = containerRef.current
+
+      const clearSelectionIfOwner = () => {
+        if (selectionOwner === token) {
+          window.getSelection()?.removeAllRanges()
+          selectionOwner = null
+        }
+      }
+
+      if (!container || query.length === 0 || activeItemKey == null) {
+        clearSelectionIfOwner()
+        return
+      }
+
+      let frame: number | null = null
+      let attempts = 0
+      const applySelection = () => {
+        frame = null
+        const { byItemKey } = collectSearchRanges(container, query)
+        const group = byItemKey.get(activeItemKey)
+        if (group && group.length > 0) {
+          const range = group[Math.min(activeOrdinal, group.length - 1)]
+          const selection = window.getSelection()
+          if (selection) {
+            selectionOwner = token
+            selection.removeAllRanges()
+            selection.addRange(range)
+          }
+          return
+        }
+        // Right after scrollToIndex the virtualized target row may not be
+        // mounted yet; retry across a few frames until it appears.
+        if (attempts < 30) {
+          attempts += 1
+          frame = requestAnimationFrame(applySelection)
+        }
+      }
+      applySelection()
+      return () => {
+        if (frame != null) cancelAnimationFrame(frame)
+        clearSelectionIfOwner()
+      }
+    }
     ensureHighlightStyles()
 
     const token = tokenRef.current
