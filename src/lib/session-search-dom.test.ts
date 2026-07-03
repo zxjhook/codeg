@@ -42,3 +42,27 @@ describe("collectSearchRanges", () => {
     root.remove()
   })
 })
+
+describe("findActiveSearchRange", () => {
+  it("returns the ordinal-th range within the item, clamped", async () => {
+    const { findActiveSearchRange } = await import("@/lib/session-search-dom")
+    const root = buildDom(
+      `<div data-thread-key="k1"><div data-search-text="">world and world</div></div>`
+    )
+    const second = findActiveSearchRange(root, "world", "k1", 1)
+    expect(second?.startOffset).toBe(10)
+    const clamped = findActiveSearchRange(root, "world", "k1", 99)
+    expect(clamped?.startOffset).toBe(10)
+    root.remove()
+  })
+
+  it("returns null when the item has no rendered match", async () => {
+    const { findActiveSearchRange } = await import("@/lib/session-search-dom")
+    const root = buildDom(
+      `<div data-thread-key="k1"><div data-search-text="">foo</div></div>`
+    )
+    expect(findActiveSearchRange(root, "world", "k1", 0)).toBeNull()
+    expect(findActiveSearchRange(root, "foo", "missing", 0)).toBeNull()
+    root.remove()
+  })
+})

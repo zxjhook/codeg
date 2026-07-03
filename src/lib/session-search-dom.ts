@@ -50,3 +50,21 @@ export function collectSearchRanges(
   }
   return { all, byItemKey }
 }
+
+/**
+ * Locate the DOM Range of the active match: the `ordinal`-th occurrence
+ * (clamped) of `query` inside the thread item marked with `itemKey`. Returns
+ * null while the virtualized row is not mounted yet. Used to scroll the
+ * active match itself into view — item-level scrollToIndex alone cannot move
+ * between matches inside one tall message.
+ */
+export function findActiveSearchRange(
+  root: HTMLElement,
+  query: string,
+  itemKey: string,
+  ordinal: number
+): Range | null {
+  const group = collectSearchRanges(root, query).byItemKey.get(itemKey)
+  if (!group || group.length === 0) return null
+  return group[Math.min(ordinal, group.length - 1)]
+}

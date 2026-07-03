@@ -77,6 +77,7 @@ import {
   normalizeSearchQuery,
   type SessionSearchMatch,
 } from "@/lib/session-search"
+import { findActiveSearchRange } from "@/lib/session-search-dom"
 
 interface MessageListViewProps {
   conversationId: number
@@ -869,16 +870,65 @@ export function MessageListView({
     )
   }, [searchOpen, debouncedQuery, threadItems])
 
+  // Two-stage jump: item-level scrollToIndex only mounts the target row —
+  // matches are character-level, and a message taller than the viewport maps
+  // every one of its matches to the same item scroll position. Stage two
+  // waits for the row to render, finds the active match's Range and scrolls
+  // the element containing it to the viewport center.
+  const scrollFrameRef = useRef<number | null>(null)
+  const scrollToActiveMatch = useCallback(
+    (match: SessionSearchMatch, query: string) => {
+      const itemKey = threadItems[match.threadIndex]?.key
+      if (itemKey == null) return
+      scrollApiRef.current?.scrollToIndex(match.threadIndex, {
+        align: "center",
+      })
+      if (scrollFrameRef.current != null) {
+        cancelAnimationFrame(scrollFrameRef.current)
+      }
+      let attempts = 0
+      const refine = () => {
+        scrollFrameRef.current = null
+        const container = searchContainerRef.current
+        if (!container) return
+        const range = findActiveSearchRange(
+          container,
+          query,
+          itemKey,
+          match.ordinalInItem
+        )
+        const target = range?.startContainer.parentElement
+        if (target) {
+          target.scrollIntoView({ block: "center", behavior: "smooth" })
+          return
+        }
+        // The virtualized row may need a few frames to mount after the
+        // coarse jump.
+        if (attempts < 30) {
+          attempts += 1
+          scrollFrameRef.current = requestAnimationFrame(refine)
+        }
+      }
+      scrollFrameRef.current = requestAnimationFrame(refine)
+    },
+    [threadItems]
+  )
+  useEffect(
+    () => () => {
+      if (scrollFrameRef.current != null) {
+        cancelAnimationFrame(scrollFrameRef.current)
+      }
+    },
+    []
+  )
+
   // New query → restart at the first match and bring it into view. Streaming
   // turns recompute `searchMatches` too; the cursor is only clamped then (no
   // jump), so an active agent reply doesn't yank the viewport around.
   useEffect(() => {
     setSearchCursor(0)
     if (debouncedQuery.length > 0 && searchMatches.length > 0) {
-      scrollApiRef.current?.scrollToIndex(searchMatches[0].threadIndex, {
-        align: "center",
-        smooth: true,
-      })
+      scrollToActiveMatch(searchMatches[0], debouncedQuery)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [debouncedQuery])
@@ -896,12 +946,9 @@ export function MessageListView({
         searchMatches.length
       )
       setSearchCursor(next)
-      scrollApiRef.current?.scrollToIndex(searchMatches[next].threadIndex, {
-        align: "center",
-        smooth: true,
-      })
+      scrollToActiveMatch(searchMatches[next], debouncedQuery)
     },
-    [searchMatches, searchCursor]
+    [searchMatches, searchCursor, debouncedQuery, scrollToActiveMatch]
   )
 
   const closeSearch = useCallback(() => {
