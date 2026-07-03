@@ -27,11 +27,7 @@ export function collectSearchRanges(
         : NodeFilter.FILTER_REJECT,
   })
 
-  for (
-    let node = walker.nextNode();
-    node !== null;
-    node = walker.nextNode()
-  ) {
+  for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
     const text = node.textContent
     if (!text) continue
     const haystack = text.toLowerCase()

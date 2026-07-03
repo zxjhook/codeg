@@ -1,8 +1,5 @@
 import { describe, it, expect } from "vitest"
-import {
-  findSessionMatches,
-  normalizeSearchQuery,
-} from "@/lib/session-search"
+import { findSessionMatches, normalizeSearchQuery } from "@/lib/session-search"
 import type { MessageTurn } from "@/lib/types"
 
 function turn(
@@ -84,7 +81,9 @@ describe("findSessionMatches", () => {
   })
 
   it("finds non-overlapping occurrences only", () => {
-    const single = [[turn("u1", "user", [{ type: "text" as const, text: "aaa" }])]]
+    const single = [
+      [turn("u1", "user", [{ type: "text" as const, text: "aaa" }])],
+    ]
     expect(findSessionMatches(single, "aa")).toHaveLength(1)
   })
 })

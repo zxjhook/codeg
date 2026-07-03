@@ -1696,3 +1696,13 @@
   outline: 2px solid var(--ring);
   outline-offset: 1px;
 }
+
+/* In-session search hits (CSS Custom Highlight API). `::highlight` only
+   accepts color-ish properties, so these read fine in light and dark. */
+::highlight(codeg-search-match) {
+  background-color: rgb(250 204 21 / 0.35);
+}
+::highlight(codeg-search-active) {
+  background-color: rgb(249 115 22 / 0.8);
+  color: rgb(255 255 255);
+}

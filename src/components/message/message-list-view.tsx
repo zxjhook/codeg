@@ -68,6 +68,13 @@ import type { MessageScrollContextValue } from "@/components/message/message-scr
 import { extractSessionFilesGrouped } from "@/lib/session-files"
 import { unescapeComposerText } from "@/lib/composer-copy-text"
 import { useStickToBottomContext } from "use-stick-to-bottom"
+import { ConversationSearchBar } from "@/components/message/conversation-search-bar"
+import { useSessionSearchHighlights } from "@/hooks/use-session-search-highlights"
+import {
+  findSessionMatches,
+  normalizeSearchQuery,
+  type SessionSearchMatch,
+} from "@/lib/session-search"
 
 interface MessageListViewProps {
   conversationId: number
@@ -144,6 +151,8 @@ const EMPTY_DELEGATIONS: DelegationCardSource[] = []
 // Stable empty reference so the navigator memo / equality checks don't churn
 // when a conversation has no user messages.
 const EMPTY_NAV_ENTRIES: MessageNavEntry[] = []
+const EMPTY_TURNS: readonly MessageTurn[] = []
+const EMPTY_MATCHES: SessionSearchMatch[] = []
 
 // Collect the `delegate_to_agent` tool calls within a turn's adapted parts,
 // recursing through tool-groups and goal-runs (a delegate call is normally a
@@ -700,7 +709,10 @@ export function MessageListView({
       case "turn": {
         const pt = item.isRoleTransition ? 16 : 0
         return (
-          <div style={pt > 0 ? { paddingTop: pt } : undefined}>
+          <div
+            data-thread-key={item.key}
+            style={pt > 0 ? { paddingTop: pt } : undefined}
+          >
             <HistoricalMessageGroup
               group={item.group}
               dimmed={item.phase === "optimistic"}
@@ -830,6 +842,106 @@ export function MessageListView({
     return entries.length > 0 ? entries : EMPTY_NAV_ENTRIES
   }, [showMessageNav, navExpanded, timelineTurns, threadItems])
 
+  // --- In-session search -------------------------------------------------
+  const [searchOpen, setSearchOpen] = useState(false)
+  const [searchQuery, setSearchQuery] = useState("")
+  const [debouncedQuery, setDebouncedQuery] = useState("")
+  const [searchCursor, setSearchCursor] = useState(0)
+  const searchContainerRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    const id = setTimeout(
+      () => setDebouncedQuery(normalizeSearchQuery(searchQuery)),
+      150
+    )
+    return () => clearTimeout(id)
+  }, [searchQuery])
+
+  const searchMatches = useMemo(() => {
+    if (!searchOpen || debouncedQuery.length === 0) return EMPTY_MATCHES
+    return findSessionMatches(
+      threadItems.map((item) =>
+        item.kind === "turn" ? item.sourceTurns : EMPTY_TURNS
+      ),
+      debouncedQuery
+    )
+  }, [searchOpen, debouncedQuery, threadItems])
+
+  // New query → restart at the first match and bring it into view. Streaming
+  // turns recompute `searchMatches` too; the cursor is only clamped then (no
+  // jump), so an active agent reply doesn't yank the viewport around.
+  useEffect(() => {
+    setSearchCursor(0)
+    if (debouncedQuery.length > 0 && searchMatches.length > 0) {
+      scrollApiRef.current?.scrollToIndex(searchMatches[0].threadIndex, {
+        align: "center",
+        smooth: true,
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [debouncedQuery])
+
+  useEffect(() => {
+    setSearchCursor((prev) =>
+      searchMatches.length === 0 ? 0 : Math.min(prev, searchMatches.length - 1)
+    )
+  }, [searchMatches])
+
+  const navigateSearch = useCallback(
+    (direction: 1 | -1) => {
+      if (searchMatches.length === 0) return
+      const next =
+        (searchCursor + direction + searchMatches.length) % searchMatches.length
+      setSearchCursor(next)
+      scrollApiRef.current?.scrollToIndex(searchMatches[next].threadIndex, {
+        align: "center",
+        smooth: true,
+      })
+    },
+    [searchMatches, searchCursor]
+  )
+
+  const closeSearch = useCallback(() => {
+    setSearchOpen(false)
+    setSearchQuery("")
+    setDebouncedQuery("")
+    setSearchCursor(0)
+  }, [])
+
+  // Cmd/Ctrl+F opens the bar (replacing the webview's native find) while this
+  // list is the active conversation view.
+  useEffect(() => {
+    if (!isActive) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (
+        (event.metaKey || event.ctrlKey) &&
+        !event.shiftKey &&
+        !event.altKey &&
+        event.key.toLowerCase() === "f"
+      ) {
+        event.preventDefault()
+        setSearchOpen(true)
+      }
+    }
+    window.addEventListener("keydown", onKeyDown)
+    return () => window.removeEventListener("keydown", onKeyDown)
+  }, [isActive])
+
+  // Switching conversations discards the search session.
+  useEffect(() => {
+    closeSearch()
+  }, [conversationId, closeSearch])
+
+  const activeSearchMatch = searchMatches[searchCursor] ?? null
+  useSessionSearchHighlights({
+    containerRef: searchContainerRef,
+    query: searchOpen ? debouncedQuery : "",
+    activeItemKey: activeSearchMatch
+      ? (threadItems[activeSearchMatch.threadIndex]?.key ?? null)
+      : null,
+    activeOrdinal: activeSearchMatch?.ordinalInItem ?? 0,
+  })
+
   const hasRenderableContent = threadItems.length > 0 || Boolean(liveMessage)
 
   if (detailLoading && !hasRenderableContent) {
@@ -901,7 +1013,10 @@ export function MessageListView({
   }
 
   return (
-    <div className="relative flex h-full min-h-0 flex-col">
+    <div
+      ref={searchContainerRef}
+      className="relative flex h-full min-h-0 flex-col"
+    >
       <MessageThread
         className="flex-1 min-h-0"
         resize={shouldUseSmoothResize ? "smooth" : undefined}
@@ -956,6 +1071,16 @@ export function MessageListView({
           overlayKey={subAgentOverlayKey}
         />
       </div>
+      {searchOpen && (
+        <ConversationSearchBar
+          query={searchQuery}
+          onQueryChange={setSearchQuery}
+          currentIndex={searchCursor}
+          totalMatches={searchMatches.length}
+          onNavigate={navigateSearch}
+          onClose={closeSearch}
+        />
+      )}
     </div>
   )
 }

@@ -2083,7 +2083,10 @@ const TextPart = memo(function TextPart({
   softBreaks?: boolean
 }) {
   return (
-    <div className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'>
+    <div
+      data-search-text=""
+      className='break-words text-sm prose prose-sm dark:prose-invert max-w-none [&_ul]:list-inside [&_ol]:list-inside [&_[data-streamdown="code-block-body"]]:max-h-96 [&_[data-streamdown="code-block-body"]]:overflow-auto'
+    >
       <MessageResponse softBreaks={softBreaks}>{text}</MessageResponse>
     </div>
   )
