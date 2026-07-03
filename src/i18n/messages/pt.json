@@ -2475,6 +2475,13 @@
         "remove": "Remover",
         "noDiffDataAvailable": "Nenhum dado de diff disponível para {filePath}"
       },
+      "searchBar": {
+        "placeholder": "Pesquisar na conversa",
+        "matchCount": "{current}/{total}",
+        "previousMatch": "Correspondência anterior",
+        "nextMatch": "Próxima correspondência",
+        "close": "Fechar pesquisa"
+      },
       "replyArtifacts": {
         "title": "Arquivos alterados",
         "fileCount": "{count, plural, one {# arquivo} other {# arquivos}}",

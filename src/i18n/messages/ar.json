@@ -2475,6 +2475,13 @@
         "remove": "إزالة",
         "noDiffDataAvailable": "لا توجد بيانات diff متاحة لـ {filePath}"
       },
+      "searchBar": {
+        "placeholder": "البحث في المحادثة",
+        "matchCount": "{current}/{total}",
+        "previousMatch": "التطابق السابق",
+        "nextMatch": "التطابق التالي",
+        "close": "إغلاق البحث"
+      },
       "replyArtifacts": {
         "title": "الملفات المتغيرة",
         "fileCount": "{count, plural, one {# ملف} other {# ملفات}}",

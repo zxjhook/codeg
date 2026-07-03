@@ -2475,6 +2475,13 @@
         "remove": "削除",
         "noDiffDataAvailable": "{filePath} の差分データがありません"
       },
+      "searchBar": {
+        "placeholder": "会話内を検索",
+        "matchCount": "{current}/{total}",
+        "previousMatch": "前の一致",
+        "nextMatch": "次の一致",
+        "close": "検索を閉じる"
+      },
       "replyArtifacts": {
         "title": "変更されたファイル",
         "fileCount": "{count, plural, one {# 個のファイル} other {# 個のファイル}}",

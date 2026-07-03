@@ -2475,6 +2475,13 @@
         "remove": "移除",
         "noDiffDataAvailable": "未找到 {filePath} 的差异数据"
       },
+      "searchBar": {
+        "placeholder": "在会话中查找",
+        "matchCount": "{current}/{total}",
+        "previousMatch": "上一个匹配",
+        "nextMatch": "下一个匹配",
+        "close": "关闭搜索"
+      },
       "replyArtifacts": {
         "title": "改动文件",
         "fileCount": "{count} 个文件",

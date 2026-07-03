@@ -2475,6 +2475,13 @@
         "remove": "제거",
         "noDiffDataAvailable": "{filePath}에 대한 diff 데이터가 없습니다"
       },
+      "searchBar": {
+        "placeholder": "대화에서 찾기",
+        "matchCount": "{current}/{total}",
+        "previousMatch": "이전 일치 항목",
+        "nextMatch": "다음 일치 항목",
+        "close": "검색 닫기"
+      },
       "replyArtifacts": {
         "title": "변경된 파일",
         "fileCount": "{count, plural, one {#개 파일} other {#개 파일}}",

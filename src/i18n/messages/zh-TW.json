@@ -2475,6 +2475,13 @@
         "remove": "移除",
         "noDiffDataAvailable": "找不到 {filePath} 的差異資料"
       },
+      "searchBar": {
+        "placeholder": "在會話中尋找",
+        "matchCount": "{current}/{total}",
+        "previousMatch": "上一個符合項",
+        "nextMatch": "下一個符合項",
+        "close": "關閉搜尋"
+      },
       "replyArtifacts": {
         "title": "變更檔案",
         "fileCount": "{count} 個檔案",
