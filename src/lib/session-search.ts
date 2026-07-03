@@ -22,6 +22,28 @@ export function normalizeSearchQuery(query: string): string {
 }
 
 /**
+ * Advance the search cursor by `direction` with wrap-around.
+ * Returns 0 when `total` is 0.
+ */
+export function nextSearchCursor(
+  cursor: number,
+  direction: 1 | -1,
+  total: number
+): number {
+  if (total === 0) return 0
+  return (cursor + direction + total) % total
+}
+
+/**
+ * Clamp `cursor` so it stays within `[0, total - 1]`.
+ * Returns 0 when `total` is 0.
+ */
+export function clampSearchCursor(cursor: number, total: number): number {
+  if (total === 0) return 0
+  return Math.min(cursor, total - 1)
+}
+
+/**
  * Case-insensitive, non-overlapping substring search over the text blocks of
  * user/assistant turns. Thinking, tool, image and plan blocks never match;
  * system turns are skipped (they render collapsed, so a hit could not be

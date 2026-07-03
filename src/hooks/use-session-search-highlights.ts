@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, type RefObject } from "react"
+import { useEffect, useRef, type RefObject } from "react"
 import { collectSearchRanges } from "@/lib/session-search-dom"
 
 const MATCH_HIGHLIGHT = "codeg-search-match"
@@ -24,6 +24,14 @@ function ensureHighlightStyles(): void {
   ].join("\n")
   document.head.appendChild(style)
 }
+
+/**
+ * Module-level ownership token. Only the instance that painted the most recent
+ * highlights holds a reference here. This prevents multiple mounted
+ * MessageListView instances (inactive tabs, tiled mode, sub-agent dialogs) from
+ * stomping on each other's highlights when clearing.
+ */
+let registryOwner: symbol | null = null
 
 interface UseSessionSearchHighlightsArgs {
   containerRef: RefObject<HTMLElement | null>
@@ -49,6 +57,10 @@ function highlightsSupported(): boolean {
  * relevant mutation (virtua mounts/unmounts rows while scrolling), coalesced
  * to one repaint per animation frame. Silently does nothing when the API is
  * unavailable — search then degrades to scroll-only.
+ *
+ * Ownership: only the instance currently painting highlights may clear the
+ * registry. Instances with an empty query never touch the registry unless they
+ * are the current owner (i.e. they painted before the query was cleared).
  */
 export function useSessionSearchHighlights({
   containerRef,
@@ -56,23 +68,36 @@ export function useSessionSearchHighlights({
   activeItemKey,
   activeOrdinal,
 }: UseSessionSearchHighlightsArgs): void {
+  // Each hook instance gets its own stable identity token.
+  const tokenRef = useRef<symbol>(Symbol())
+
   useEffect(() => {
     if (!highlightsSupported()) return
     ensureHighlightStyles()
+
+    const token = tokenRef.current
     const container = containerRef.current
-    const clear = () => {
-      CSS.highlights.delete(MATCH_HIGHLIGHT)
-      CSS.highlights.delete(ACTIVE_HIGHLIGHT)
+
+    const clearIfOwner = () => {
+      if (registryOwner === token) {
+        CSS.highlights.delete(MATCH_HIGHLIGHT)
+        CSS.highlights.delete(ACTIVE_HIGHLIGHT)
+        registryOwner = null
+      }
     }
+
     if (!container || query.length === 0) {
-      clear()
+      clearIfOwner()
       return
     }
 
     let frame: number | null = null
     const apply = () => {
       frame = null
-      clear()
+      // Take ownership before writing to the registry.
+      registryOwner = token
+      CSS.highlights.delete(MATCH_HIGHLIGHT)
+      CSS.highlights.delete(ACTIVE_HIGHLIGHT)
       const { all, byItemKey } = collectSearchRanges(container, query)
       if (all.length === 0) return
       let activeRange: Range | null = null
@@ -104,7 +129,7 @@ export function useSessionSearchHighlights({
     return () => {
       observer.disconnect()
       if (frame != null) cancelAnimationFrame(frame)
-      clear()
+      clearIfOwner()
     }
   }, [containerRef, query, activeItemKey, activeOrdinal])
 }

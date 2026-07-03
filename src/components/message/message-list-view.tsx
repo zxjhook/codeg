@@ -71,7 +71,9 @@ import { useStickToBottomContext } from "use-stick-to-bottom"
 import { ConversationSearchBar } from "@/components/message/conversation-search-bar"
 import { useSessionSearchHighlights } from "@/hooks/use-session-search-highlights"
 import {
+  clampSearchCursor,
   findSessionMatches,
+  nextSearchCursor,
   normalizeSearchQuery,
   type SessionSearchMatch,
 } from "@/lib/session-search"
@@ -152,7 +154,7 @@ const EMPTY_DELEGATIONS: DelegationCardSource[] = []
 // when a conversation has no user messages.
 const EMPTY_NAV_ENTRIES: MessageNavEntry[] = []
 const EMPTY_TURNS: readonly MessageTurn[] = []
-const EMPTY_MATCHES: SessionSearchMatch[] = []
+const EMPTY_MATCHES: readonly SessionSearchMatch[] = []
 
 // Collect the `delegate_to_agent` tool calls within a turn's adapted parts,
 // recursing through tool-groups and goal-runs (a delegate call is normally a
@@ -882,16 +884,17 @@ export function MessageListView({
   }, [debouncedQuery])
 
   useEffect(() => {
-    setSearchCursor((prev) =>
-      searchMatches.length === 0 ? 0 : Math.min(prev, searchMatches.length - 1)
-    )
+    setSearchCursor((prev) => clampSearchCursor(prev, searchMatches.length))
   }, [searchMatches])
 
   const navigateSearch = useCallback(
     (direction: 1 | -1) => {
       if (searchMatches.length === 0) return
-      const next =
-        (searchCursor + direction + searchMatches.length) % searchMatches.length
+      const next = nextSearchCursor(
+        searchCursor,
+        direction,
+        searchMatches.length
+      )
       setSearchCursor(next)
       scrollApiRef.current?.scrollToIndex(searchMatches[next].threadIndex, {
         align: "center",
@@ -927,15 +930,21 @@ export function MessageListView({
     return () => window.removeEventListener("keydown", onKeyDown)
   }, [isActive])
 
-  // Switching conversations discards the search session.
+  // Switching conversations discards the search session, and so does the
+  // panel going inactive (hidden tab, tiled mode losing focus): an inactive
+  // view must not keep painting into the shared highlight registry.
   useEffect(() => {
     closeSearch()
   }, [conversationId, closeSearch])
 
+  useEffect(() => {
+    if (!isActive) closeSearch()
+  }, [isActive, closeSearch])
+
   const activeSearchMatch = searchMatches[searchCursor] ?? null
   useSessionSearchHighlights({
     containerRef: searchContainerRef,
-    query: searchOpen ? debouncedQuery : "",
+    query: searchOpen && isActive ? debouncedQuery : "",
     activeItemKey: activeSearchMatch
       ? (threadItems[activeSearchMatch.threadIndex]?.key ?? null)
       : null,

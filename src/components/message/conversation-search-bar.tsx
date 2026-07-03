@@ -40,12 +40,16 @@ export function ConversationSearchBar({
   const current = totalMatches === 0 ? 0 : currentIndex + 1
 
   return (
-    <div className="pointer-events-auto absolute end-2 top-2 z-30 flex items-center gap-1 rounded-lg border bg-card/95 px-2 py-1.5 shadow-lg backdrop-blur supports-[backdrop-filter]:bg-card/85">
+    <div
+      role="search"
+      className="pointer-events-auto absolute end-2 top-2 z-30 flex items-center gap-1 rounded-lg border bg-card/95 px-2 py-1.5 shadow-lg backdrop-blur supports-[backdrop-filter]:bg-card/85"
+    >
       <input
         ref={inputRef}
         value={query}
         onChange={(e) => onQueryChange(e.target.value)}
         onKeyDown={(e) => {
+          if (e.nativeEvent.isComposing || e.key === "Process") return
           if (e.key === "Enter") {
             e.preventDefault()
             onNavigate(e.shiftKey ? -1 : 1)

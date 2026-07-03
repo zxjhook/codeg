@@ -1,5 +1,10 @@
 import { describe, it, expect } from "vitest"
-import { findSessionMatches, normalizeSearchQuery } from "@/lib/session-search"
+import {
+  findSessionMatches,
+  normalizeSearchQuery,
+  nextSearchCursor,
+  clampSearchCursor,
+} from "@/lib/session-search"
 import type { MessageTurn } from "@/lib/types"
 
 function turn(
@@ -85,5 +90,44 @@ describe("findSessionMatches", () => {
       [turn("u1", "user", [{ type: "text" as const, text: "aaa" }])],
     ]
     expect(findSessionMatches(single, "aa")).toHaveLength(1)
+  })
+})
+
+describe("nextSearchCursor", () => {
+  it("wraps forward from last index to 0", () => {
+    expect(nextSearchCursor(4, 1, 5)).toBe(0)
+  })
+
+  it("wraps backward from 0 to last index", () => {
+    expect(nextSearchCursor(0, -1, 5)).toBe(4)
+  })
+
+  it("returns 0 when total is 0", () => {
+    expect(nextSearchCursor(0, 1, 0)).toBe(0)
+    expect(nextSearchCursor(0, -1, 0)).toBe(0)
+  })
+
+  it("advances normally within bounds", () => {
+    expect(nextSearchCursor(2, 1, 5)).toBe(3)
+    expect(nextSearchCursor(2, -1, 5)).toBe(1)
+  })
+})
+
+describe("clampSearchCursor", () => {
+  it("clamps cursor when beyond total", () => {
+    expect(clampSearchCursor(10, 5)).toBe(4)
+  })
+
+  it("is a no-op when cursor is within range", () => {
+    expect(clampSearchCursor(3, 5)).toBe(3)
+  })
+
+  it("returns 0 when total is 0", () => {
+    expect(clampSearchCursor(0, 0)).toBe(0)
+    expect(clampSearchCursor(5, 0)).toBe(0)
+  })
+
+  it("clamps to last index when cursor equals total", () => {
+    expect(clampSearchCursor(5, 5)).toBe(4)
   })
 })
